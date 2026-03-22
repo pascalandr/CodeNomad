@@ -225,3 +225,51 @@ export function projectMessageEntries(
   flushContent()
   return entries
 }
+
+export function buildMessageProjectionStructureKey(record: MessageRecord | undefined): string {
+  if (!record) return ""
+
+  const tokens: string[] = []
+  let pendingContentStart = ""
+
+  const flushContent = () => {
+    if (!pendingContentStart) return
+    tokens.push(`content:${pendingContentStart}`)
+    pendingContentStart = ""
+  }
+
+  for (const partId of record.partIds) {
+    const part = record.parts[partId]?.data
+    if (!part || !isSupportedPartType(part)) continue
+
+    if (part.type === "tool") {
+      flushContent()
+      tokens.push(`tool:${partId}`)
+      continue
+    }
+
+    if (part.type === "compaction") {
+      flushContent()
+      tokens.push(`compaction:${partId}:${Boolean((part as any)?.auto) ? 1 : 0}`)
+      continue
+    }
+
+    if (part.type === "step-start" || part.type === "step-finish") {
+      flushContent()
+      continue
+    }
+
+    if (part.type === "reasoning") {
+      flushContent()
+      tokens.push(`reasoning:${partId}`)
+      continue
+    }
+
+    if (!pendingContentStart) {
+      pendingContentStart = partId
+    }
+  }
+
+  flushContent()
+  return tokens.join("|")
+}

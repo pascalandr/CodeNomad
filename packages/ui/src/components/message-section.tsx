@@ -3,6 +3,7 @@ import { MoreHorizontal, Trash, X } from "lucide-solid"
 import Kbd from "./kbd"
 import MessageBlock from "./message-block"
 import { getMessageAnchorId, getMessageIdFromAnchorId } from "./message-anchors"
+import { buildMessageProjectionStructureKey } from "./message-render-projection"
 import MessageTimeline, { buildTimelineSegments, type TimelineSegment } from "./message-timeline"
 import VirtualFollowList, { type VirtualFollowListApi, type VirtualFollowListState } from "./virtual-follow-list"
 import { useConfig } from "../stores/preferences"
@@ -331,7 +332,7 @@ export default function MessageSection(props: MessageSectionProps) {
 
   const seenTimelineMessageIds = new Set<string>()
   const seenTimelineSegmentKeys = new Set<string>()
-  const timelinePartCountsByMessageId = new Map<string, number>()
+  const timelineStructureKeysByMessageId = new Map<string, string>()
   let pendingTimelineMessagePartUpdates = new Set<string>()
   let pendingTimelinePartUpdateFrame: number | null = null
 
@@ -342,7 +343,7 @@ export default function MessageSection(props: MessageSectionProps) {
   function seedTimeline() {
     seenTimelineMessageIds.clear()
     seenTimelineSegmentKeys.clear()
-    timelinePartCountsByMessageId.clear()
+    timelineStructureKeysByMessageId.clear()
     const ids = untrack(messageIds)
     const resolvedStore = untrack(store)
     const segments: TimelineSegment[] = []
@@ -350,7 +351,7 @@ export default function MessageSection(props: MessageSectionProps) {
       const record = resolvedStore.getMessage(messageId)
       if (!record) return
       seenTimelineMessageIds.add(messageId)
-      timelinePartCountsByMessageId.set(messageId, record.partIds.length)
+      timelineStructureKeysByMessageId.set(messageId, buildMessageProjectionStructureKey(record))
       const built = buildTimelineSegments(props.instanceId, record, t)
       built.forEach((segment) => {
         const key = makeTimelineKey(segment)
@@ -365,7 +366,7 @@ export default function MessageSection(props: MessageSectionProps) {
   function appendTimelineForMessage(messageId: string) {
     const record = untrack(() => store().getMessage(messageId))
     if (!record) return
-    timelinePartCountsByMessageId.set(messageId, record.partIds.length)
+    timelineStructureKeysByMessageId.set(messageId, buildMessageProjectionStructureKey(record))
     const built = buildTimelineSegments(props.instanceId, record, t)
     if (built.length === 0) return
     const newSegments: TimelineSegment[] = []
@@ -740,7 +741,7 @@ export default function MessageSection(props: MessageSectionProps) {
       setTimelineSegments([])
       seenTimelineMessageIds.clear()
       seenTimelineSegmentKeys.clear()
-      timelinePartCountsByMessageId.clear()
+      timelineStructureKeysByMessageId.clear()
       pendingTimelineMessagePartUpdates.clear()
       if (pendingTimelinePartUpdateFrame !== null) {
         cancelAnimationFrame(pendingTimelinePartUpdateFrame)
@@ -789,10 +790,10 @@ export default function MessageSection(props: MessageSectionProps) {
           })
 
           // Keep part count tracking in sync with id replacement.
-          const existingPartCount = timelinePartCountsByMessageId.get(oldId)
-          if (existingPartCount !== undefined) {
-            timelinePartCountsByMessageId.delete(oldId)
-            timelinePartCountsByMessageId.set(newId, existingPartCount)
+          const existingStructureKey = timelineStructureKeysByMessageId.get(oldId)
+          if (existingStructureKey !== undefined) {
+            timelineStructureKeysByMessageId.delete(oldId)
+            timelineStructureKeysByMessageId.set(newId, existingStructureKey)
           }
 
           previousTimelineIds = ids.slice()
@@ -880,9 +881,7 @@ export default function MessageSection(props: MessageSectionProps) {
     })
   }
 
-  // Keep timeline segments in sync when message parts are added/removed.
-  // Part deletion does not remove message ids from the session, so we must
-  // explicitly replace segments for messages whose part count changed.
+  // Keep timeline segments in sync when a message's structural projection changes.
   createEffect(() => {
     if (props.loading) return
     const ids = messageIds()
@@ -891,25 +890,25 @@ export default function MessageSection(props: MessageSectionProps) {
     let hasChanges = false
     for (const messageId of ids) {
       const record = resolvedStore.getMessage(messageId)
-      const partCount = record?.partIds.length ?? 0
-      const previousCount = timelinePartCountsByMessageId.get(messageId)
+      const structureKey = buildMessageProjectionStructureKey(record)
+      const previousStructureKey = timelineStructureKeysByMessageId.get(messageId)
 
-      if (previousCount === undefined) {
-        timelinePartCountsByMessageId.set(messageId, partCount)
+      if (previousStructureKey === undefined) {
+        timelineStructureKeysByMessageId.set(messageId, structureKey)
         continue
       }
 
-      if (previousCount !== partCount) {
-        timelinePartCountsByMessageId.set(messageId, partCount)
+      if (previousStructureKey !== structureKey) {
+        timelineStructureKeysByMessageId.set(messageId, structureKey)
         pendingTimelineMessagePartUpdates.add(messageId)
         hasChanges = true
       }
     }
 
     // Drop tracking for ids that are no longer present.
-    for (const trackedId of Array.from(timelinePartCountsByMessageId.keys())) {
+    for (const trackedId of Array.from(timelineStructureKeysByMessageId.keys())) {
       if (!ids.includes(trackedId)) {
-        timelinePartCountsByMessageId.delete(trackedId)
+        timelineStructureKeysByMessageId.delete(trackedId)
       }
     }
 
