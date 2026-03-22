@@ -17,6 +17,16 @@ export type DesktopEventTransportState =
   | "error"
   | "stopped"
 
+export interface DesktopEventTransportStats {
+  rawEvents: number
+  emittedEvents: number
+  emittedBatches: number
+  deltaCoalesces: number
+  snapshotCoalesces: number
+  statusCoalesces: number
+  supersededDeltasDropped: number
+}
+
 export interface DesktopEventTransportStatusPayload {
   generation: number
   state: DesktopEventTransportState
@@ -25,6 +35,7 @@ export interface DesktopEventTransportStatusPayload {
   reason?: string
   nextDelayMs?: number
   statusCode?: number
+  stats?: DesktopEventTransportStats
 }
 
 export interface DesktopEventsStartResult {

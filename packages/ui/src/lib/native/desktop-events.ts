@@ -62,6 +62,7 @@ export async function connectTauriWorkspaceEvents(
         reason: payload.reason,
         reconnectAttempt: payload.reconnectAttempt,
         nextDelayMs: payload.nextDelayMs,
+        stats: payload.stats,
       })
     } else if (payload.state === "error") {
       log.warn("Native desktop event transport reported an error", {
@@ -69,6 +70,13 @@ export async function connectTauriWorkspaceEvents(
         reconnectAttempt: payload.reconnectAttempt,
         nextDelayMs: payload.nextDelayMs,
         statusCode: payload.statusCode,
+        stats: payload.stats,
+      })
+    } else if ((payload.state === "disconnected" || payload.state === "stopped") && payload.stats) {
+      log.info("Native desktop event transport stats", {
+        state: payload.state,
+        reconnectAttempt: payload.reconnectAttempt,
+        stats: payload.stats,
       })
     }
 

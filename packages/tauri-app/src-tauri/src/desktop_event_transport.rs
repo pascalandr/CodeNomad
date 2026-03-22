@@ -121,6 +121,19 @@ struct DesktopEventStreamStatusPayload {
     reason: Option<String>,
     next_delay_ms: Option<u64>,
     status_code: Option<u16>,
+    stats: DesktopEventTransportStats,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopEventTransportStats {
+    raw_events: u64,
+    emitted_events: u64,
+    emitted_batches: u64,
+    delta_coalesces: u64,
+    snapshot_coalesces: u64,
+    status_coalesces: u64,
+    superseded_deltas_dropped: u64,
 }
 
 struct DesktopEventTransportState {
@@ -180,7 +193,7 @@ struct PendingBatch {
 }
 
 impl PendingBatch {
-    fn push(&mut self, event: Value) {
+    fn push(&mut self, event: Value, stats: &mut DesktopEventTransportStats) {
         match classify_event(&event) {
             EventDeliveryPolicy::CoalesceDelta(key) => {
                 let Some(scope) = delta_scope(&event) else {
@@ -196,6 +209,7 @@ impl PendingBatch {
                 {
                     if existing_key == &key {
                         append_delta(existing_event, &event);
+                        stats.delta_coalesces = stats.delta_coalesces.saturating_add(1);
                         return;
                     }
                 }
@@ -210,6 +224,7 @@ impl PendingBatch {
                 {
                     if existing_key == &key {
                         *existing_event = event;
+                        stats.status_coalesces = stats.status_coalesces.saturating_add(1);
                         return;
                     }
                 }
@@ -218,11 +233,17 @@ impl PendingBatch {
             }
             EventDeliveryPolicy::CoalesceSnapshot(key) => {
                 if let Some(part_scope) = snapshot_superseded_delta_scope(&event) {
+                    let mut dropped = 0_u64;
                     while matches!(
                         self.events.last(),
                         Some(PendingEntry::Delta { scope, .. }) if scope == &part_scope
                     ) {
                         self.events.pop();
+                        dropped = dropped.saturating_add(1);
+                    }
+                    if dropped > 0 {
+                        stats.superseded_deltas_dropped =
+                            stats.superseded_deltas_dropped.saturating_add(dropped);
                     }
                 }
 
@@ -233,6 +254,7 @@ impl PendingBatch {
                 {
                     if existing_key == &key {
                         *existing_event = event;
+                        stats.snapshot_coalesces = stats.snapshot_coalesces.saturating_add(1);
                         return;
                     }
                 }
@@ -349,6 +371,7 @@ fn run_transport_loop(
     config: DesktopEventTransportConfig,
 ) {
     let mut reconnect_attempt = 0_u32;
+    let mut stats = DesktopEventTransportStats::default();
 
     loop {
         if stop.load(Ordering::SeqCst) || !generation_matches(&state, generation) {
@@ -364,6 +387,7 @@ fn run_transport_loop(
             None,
             None,
             None,
+            &stats,
         );
 
         match open_stream(&app, &config.stream) {
@@ -378,10 +402,11 @@ fn run_transport_loop(
                     None,
                     None,
                     None,
+                    &stats,
                 );
 
                 let disconnect_reason =
-                    consume_stream(&app, response, &state, generation, stop.clone());
+                    consume_stream(&app, response, &state, generation, stop.clone(), &mut stats);
                 if stop.load(Ordering::SeqCst) || !generation_matches(&state, generation) {
                     break;
                 }
@@ -396,6 +421,7 @@ fn run_transport_loop(
                     "disconnected",
                     disconnect_reason,
                     None,
+                    &stats,
                 ) {
                     break;
                 }
@@ -416,6 +442,7 @@ fn run_transport_loop(
                     state_name,
                     Some(error.message),
                     error.status_code,
+                    &stats,
                 ) {
                     break;
                 }
@@ -432,6 +459,7 @@ fn run_transport_loop(
         None,
         None,
         None,
+        &stats,
     );
 }
 
@@ -445,6 +473,7 @@ fn schedule_retry(
     state_name: &'static str,
     reason: Option<String>,
     status_code: Option<u16>,
+    stats: &DesktopEventTransportStats,
 ) -> bool {
     *reconnect_attempt = reconnect_attempt.saturating_add(1);
     let terminal = policy
@@ -466,6 +495,7 @@ fn schedule_retry(
         reason,
         next_delay_ms,
         status_code,
+        stats,
     );
 
     if terminal {
@@ -597,6 +627,7 @@ fn consume_stream(
     state: &Arc<Mutex<DesktopEventTransportState>>,
     generation: u64,
     stop: Arc<AtomicBool>,
+    stats: &mut DesktopEventTransportStats,
 ) -> Option<String> {
     let (tx, rx) = mpsc::channel::<ReaderMessage>();
     let reader_stop = stop.clone();
@@ -613,29 +644,30 @@ fn consume_stream(
 
         match rx.recv_timeout(Duration::from_millis(FLUSH_INTERVAL_MS)) {
             Ok(ReaderMessage::Event(event)) => {
-                pending.push(event);
+                stats.raw_events = stats.raw_events.saturating_add(1);
+                pending.push(event, stats);
                 if pending.pending_len() >= MAX_BATCH_EVENTS {
                     sequence += 1;
-                    emit_batch(app, generation, &mut pending, sequence, state);
+                    emit_batch(app, generation, &mut pending, sequence, state, stats);
                 }
             }
             Ok(ReaderMessage::End(reason)) => {
                 if !pending.is_empty() {
                     sequence += 1;
-                    emit_batch(app, generation, &mut pending, sequence, state);
+                    emit_batch(app, generation, &mut pending, sequence, state, stats);
                 }
                 return reason;
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() {
                     sequence += 1;
-                    emit_batch(app, generation, &mut pending, sequence, state);
+                    emit_batch(app, generation, &mut pending, sequence, state, stats);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
                 if !pending.is_empty() {
                     sequence += 1;
-                    emit_batch(app, generation, &mut pending, sequence, state);
+                    emit_batch(app, generation, &mut pending, sequence, state, stats);
                 }
                 return Some("reader disconnected".to_string());
             }
@@ -721,6 +753,7 @@ fn emit_batch(
     pending: &mut PendingBatch,
     sequence: u64,
     state: &Arc<Mutex<DesktopEventTransportState>>,
+    stats: &mut DesktopEventTransportStats,
 ) {
     if !generation_matches(state, generation) {
         return;
@@ -730,6 +763,9 @@ fn emit_batch(
     if events.is_empty() {
         return;
     }
+
+    stats.emitted_batches = stats.emitted_batches.saturating_add(1);
+    stats.emitted_events = stats.emitted_events.saturating_add(events.len() as u64);
 
     let _ = app.emit(
         EVENT_BATCH_NAME,
@@ -754,6 +790,7 @@ fn emit_status(
     reason: Option<String>,
     next_delay_ms: Option<u64>,
     status_code: Option<u16>,
+    stats: &DesktopEventTransportStats,
 ) {
     let _ = app.emit(
         EVENT_STATUS_NAME,
@@ -765,6 +802,7 @@ fn emit_status(
             reason,
             next_delay_ms,
             status_code,
+            stats: stats.clone(),
         },
     );
 }
@@ -951,6 +989,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn fresh_stats() -> DesktopEventTransportStats {
+        DesktopEventTransportStats::default()
+    }
+
     fn delta_event(delta: &str) -> Value {
         json!({
             "type": "instance.event",
@@ -1007,8 +1049,9 @@ mod tests {
     #[test]
     fn coalesces_message_part_delta_events() {
         let mut pending = PendingBatch::default();
-        pending.push(delta_event("Hello"));
-        pending.push(delta_event(" world"));
+        let mut stats = fresh_stats();
+        pending.push(delta_event("Hello"), &mut stats);
+        pending.push(delta_event(" world"), &mut stats);
 
         let events = pending.take_events();
         assert_eq!(events.len(), 1);
@@ -1021,16 +1064,23 @@ mod tests {
     #[test]
     fn last_write_wins_for_status_events() {
         let mut pending = PendingBatch::default();
-        pending.push(json!({
-            "type": "instance.eventStatus",
-            "instanceId": "inst-1",
-            "status": "connecting"
-        }));
-        pending.push(json!({
-            "type": "instance.eventStatus",
-            "instanceId": "inst-1",
-            "status": "connected"
-        }));
+        let mut stats = fresh_stats();
+        pending.push(
+            json!({
+                "type": "instance.eventStatus",
+                "instanceId": "inst-1",
+                "status": "connecting"
+            }),
+            &mut stats,
+        );
+        pending.push(
+            json!({
+                "type": "instance.eventStatus",
+                "instanceId": "inst-1",
+                "status": "connected"
+            }),
+            &mut stats,
+        );
 
         let events = pending.take_events();
         assert_eq!(events.len(), 1);
@@ -1040,8 +1090,9 @@ mod tests {
     #[test]
     fn last_write_wins_for_consecutive_snapshot_events() {
         let mut pending = PendingBatch::default();
-        pending.push(message_part_updated_event("Hello"));
-        pending.push(message_part_updated_event("Hello world"));
+        let mut stats = fresh_stats();
+        pending.push(message_part_updated_event("Hello"), &mut stats);
+        pending.push(message_part_updated_event("Hello world"), &mut stats);
 
         let events = pending.take_events();
         assert_eq!(events.len(), 1);
@@ -1054,24 +1105,28 @@ mod tests {
     #[test]
     fn interleaved_snapshot_keys_keep_order() {
         let mut pending = PendingBatch::default();
-        pending.push(message_part_updated_event("A1"));
-        pending.push(json!({
-            "type": "instance.event",
-            "instanceId": "inst-1",
-            "event": {
-                "type": "message.part.updated",
-                "properties": {
-                    "part": {
-                        "id": "part-2",
-                        "type": "text",
-                        "text": "B1",
-                        "sessionID": "sess-1",
-                        "messageID": "msg-1"
+        let mut stats = fresh_stats();
+        pending.push(message_part_updated_event("A1"), &mut stats);
+        pending.push(
+            json!({
+                "type": "instance.event",
+                "instanceId": "inst-1",
+                "event": {
+                    "type": "message.part.updated",
+                    "properties": {
+                        "part": {
+                            "id": "part-2",
+                            "type": "text",
+                            "text": "B1",
+                            "sessionID": "sess-1",
+                            "messageID": "msg-1"
+                        }
                     }
                 }
-            }
-        }));
-        pending.push(message_part_updated_event("A2"));
+            }),
+            &mut stats,
+        );
+        pending.push(message_part_updated_event("A2"), &mut stats);
 
         let events = pending.take_events();
         assert_eq!(events.len(), 3);
@@ -1092,8 +1147,9 @@ mod tests {
     #[test]
     fn snapshot_replaces_trailing_deltas_for_same_part() {
         let mut pending = PendingBatch::default();
-        pending.push(delta_event("Hello"));
-        pending.push(message_part_updated_event("Hello world"));
+        let mut stats = fresh_stats();
+        pending.push(delta_event("Hello"), &mut stats);
+        pending.push(message_part_updated_event("Hello world"), &mut stats);
 
         let events = pending.take_events();
         assert_eq!(events.len(), 1);
@@ -1110,17 +1166,21 @@ mod tests {
     #[test]
     fn structural_events_force_coalesced_flush_before_append() {
         let mut pending = PendingBatch::default();
-        pending.push(delta_event("Hello"));
-        pending.push(json!({
-            "type": "instance.event",
-            "instanceId": "inst-1",
-            "event": {
-                "type": "message.updated",
-                "properties": {
-                    "id": "msg-1"
+        let mut stats = fresh_stats();
+        pending.push(delta_event("Hello"), &mut stats);
+        pending.push(
+            json!({
+                "type": "instance.event",
+                "instanceId": "inst-1",
+                "event": {
+                    "type": "message.updated",
+                    "properties": {
+                        "id": "msg-1"
+                    }
                 }
-            }
-        }));
+            }),
+            &mut stats,
+        );
 
         let events = pending.take_events();
         assert_eq!(events.len(), 2);
@@ -1134,9 +1194,10 @@ mod tests {
     #[test]
     fn interleaved_delta_keys_keep_order() {
         let mut pending = PendingBatch::default();
-        pending.push(delta_event_for("part-1", "A1"));
-        pending.push(delta_event_for("part-2", "B1"));
-        pending.push(delta_event_for("part-1", "A2"));
+        let mut stats = fresh_stats();
+        pending.push(delta_event_for("part-1", "A1"), &mut stats);
+        pending.push(delta_event_for("part-2", "B1"), &mut stats);
+        pending.push(delta_event_for("part-1", "A2"), &mut stats);
 
         let events = pending.take_events();
         assert_eq!(events.len(), 3);
