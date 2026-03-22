@@ -154,6 +154,7 @@ interface ContentDisplayItem {
   key: string
   messageId: string
   startPartId: string
+  partIds: string[]
 }
 
 interface ToolDisplayItem {
@@ -169,6 +170,7 @@ interface MessageContentItemProps {
   store: () => InstanceMessageStore
   messageId: string
   startPartId: string
+  partIds: string[]
   messageIndex: number
   lastAssistantIndex: () => number
   onRevert?: (messageId: string) => void
@@ -200,18 +202,11 @@ function MessageContentItem(props: MessageContentItemProps) {
   const parts = createMemo<ClientPart[]>(() => {
     const current = record()
     if (!current) return []
-    const ids = current.partIds
-    const startIndex = ids.indexOf(props.startPartId)
-    if (startIndex === -1) return []
-
     const resolved: ClientPart[] = []
-    for (let idx = startIndex; idx < ids.length; idx++) {
-      const partId = ids[idx]
+    for (const partId of props.partIds) {
       const part = current.parts[partId]?.data
       if (!part) continue
       if (!isSupportedPartType(part)) continue
-
-      if (!isContentPartType((part as any).type)) break
       resolved.push(part)
     }
 
@@ -613,8 +608,11 @@ export default function MessageBlock(props: MessageBlockProps) {
             key: segmentKey,
             messageId: current.id,
             startPartId: entry.startPartId,
+            partIds: entry.partIds,
           }
           sessionCache.messageItems.set(segmentKey, cached)
+        } else {
+          cached.partIds = entry.partIds
         }
 
         items.push(cached)
@@ -728,6 +726,7 @@ export default function MessageBlock(props: MessageBlockProps) {
                     store={props.store}
                     messageId={(item as ContentDisplayItem).messageId}
                     startPartId={(item as ContentDisplayItem).startPartId}
+                    partIds={(item as ContentDisplayItem).partIds}
                     messageIndex={props.messageIndex}
                     lastAssistantIndex={props.lastAssistantIndex}
                     showDeleteMessage={index() === 0}
