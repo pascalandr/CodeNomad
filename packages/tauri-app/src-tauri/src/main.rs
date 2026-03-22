@@ -1,8 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cli_manager;
+mod desktop_event_transport;
 
 use cli_manager::{CliProcessManager, CliStatus};
+use desktop_event_transport::{
+    DesktopEventTransportManager, DesktopEventsStartRequest, DesktopEventsStartResult,
+};
 use keepawake::KeepAwake;
 use serde::Deserialize;
 use serde_json::json;
@@ -31,6 +35,7 @@ const WINDOWS_APP_USER_MODEL_ID: &str = "ai.neuralnomads.codenomad.client";
 
 pub struct AppState {
     pub manager: CliProcessManager,
+    pub desktop_events: DesktopEventTransportManager,
     pub wake_lock: Mutex<Option<KeepAwake>>,
 }
 
@@ -50,12 +55,28 @@ fn cli_get_status(state: tauri::State<AppState>) -> CliStatus {
 #[tauri::command]
 fn cli_restart(app: AppHandle, state: tauri::State<AppState>) -> Result<CliStatus, String> {
     let dev_mode = is_dev_mode();
+    state.desktop_events.stop();
     state.manager.stop().map_err(|e| e.to_string())?;
     state
         .manager
         .start(app, dev_mode)
         .map_err(|e| e.to_string())?;
     Ok(state.manager.status())
+}
+
+#[tauri::command]
+fn desktop_events_start(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    request: Option<DesktopEventsStartRequest>,
+) -> DesktopEventsStartResult {
+    let config = state.manager.desktop_event_stream_config();
+    state.desktop_events.start(app, config, request)
+}
+
+#[tauri::command]
+fn desktop_events_stop(state: tauri::State<AppState>) {
+    state.desktop_events.stop();
 }
 
 #[tauri::command]
@@ -185,6 +206,7 @@ fn main() {
         .plugin(navigation_guard)
         .manage(AppState {
             manager: CliProcessManager::new(),
+            desktop_events: DesktopEventTransportManager::new(),
             wake_lock: Mutex::new(None),
         })
         .setup(|app| {
@@ -203,6 +225,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             cli_get_status,
             cli_restart,
+            desktop_events_start,
+            desktop_events_stop,
             wake_lock_start,
             wake_lock_stop
         ])
@@ -295,6 +319,7 @@ fn main() {
                 let app = app_handle.clone();
                 std::thread::spawn(move || {
                     if let Some(state) = app.try_state::<AppState>() {
+                        state.desktop_events.stop();
                         let _ = state.manager.stop();
                     }
                     app.exit(0);

@@ -1,3 +1,4 @@
+use crate::desktop_event_transport::DesktopEventStreamConfig;
 use dirs::home_dir;
 use parking_lot::Mutex;
 use regex::Regex;
@@ -344,6 +345,7 @@ pub struct CliProcessManager {
     child: Arc<Mutex<Option<Child>>>,
     ready: Arc<AtomicBool>,
     bootstrap_token: Arc<Mutex<Option<String>>>,
+    session_cookie: Arc<Mutex<Option<String>>>,
 }
 
 impl CliProcessManager {
@@ -353,6 +355,7 @@ impl CliProcessManager {
             child: Arc::new(Mutex::new(None)),
             ready: Arc::new(AtomicBool::new(false)),
             bootstrap_token: Arc::new(Mutex::new(None)),
+            session_cookie: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -361,6 +364,7 @@ impl CliProcessManager {
         self.stop()?;
         self.ready.store(false, Ordering::SeqCst);
         *self.bootstrap_token.lock() = None;
+        *self.session_cookie.lock() = None;
         {
             let mut status = self.status.lock();
             status.state = CliState::Starting;
@@ -375,6 +379,7 @@ impl CliProcessManager {
         let child_arc = self.child.clone();
         let ready_flag = self.ready.clone();
         let token_arc = self.bootstrap_token.clone();
+        let session_cookie_arc = self.session_cookie.clone();
         thread::spawn(move || {
             if let Err(err) = Self::spawn_cli(
                 app.clone(),
@@ -382,6 +387,7 @@ impl CliProcessManager {
                 child_arc,
                 ready_flag,
                 token_arc,
+                session_cookie_arc,
                 dev,
             ) {
                 log_line(&format!("cli spawn failed: {err}"));
@@ -459,6 +465,7 @@ impl CliProcessManager {
         status.port = None;
         status.url = None;
         status.error = None;
+        *self.session_cookie.lock() = None;
 
         Ok(())
     }
@@ -467,12 +474,25 @@ impl CliProcessManager {
         self.status.lock().clone()
     }
 
+    pub fn desktop_event_stream_config(&self) -> Option<DesktopEventStreamConfig> {
+        let base_url = self.status.lock().url.clone()?;
+        let events_url = format!("{}/api/events", base_url.trim_end_matches('/'));
+
+        Some(DesktopEventStreamConfig {
+            base_url,
+            events_url,
+            cookie_name: SESSION_COOKIE_NAME.to_string(),
+            session_cookie: self.session_cookie.lock().clone(),
+        })
+    }
+
     fn spawn_cli(
         app: AppHandle,
         status: Arc<Mutex<CliStatus>>,
         child_holder: Arc<Mutex<Option<Child>>>,
         ready: Arc<AtomicBool>,
         bootstrap_token: Arc<Mutex<Option<String>>>,
+        session_cookie: Arc<Mutex<Option<String>>>,
         dev: bool,
     ) -> anyhow::Result<()> {
         log_line("resolving CLI entry");
@@ -563,6 +583,7 @@ impl CliProcessManager {
         let app_clone = app.clone();
         let ready_clone = ready.clone();
         let token_clone = bootstrap_token.clone();
+        let session_cookie_clone = session_cookie.clone();
 
         thread::spawn(move || {
             let stdout = child_clone
@@ -584,6 +605,7 @@ impl CliProcessManager {
                     &status_clone,
                     &ready_clone,
                     &token_clone,
+                    &session_cookie_clone,
                 );
             }
             if let Some(reader) = stderr {
@@ -594,6 +616,7 @@ impl CliProcessManager {
                     &status_clone,
                     &ready_clone,
                     &token_clone,
+                    &session_cookie_clone,
                 );
             }
         });
@@ -710,6 +733,7 @@ impl CliProcessManager {
         status: &Arc<Mutex<CliStatus>>,
         ready: &Arc<AtomicBool>,
         bootstrap_token: &Arc<Mutex<Option<String>>>,
+        session_cookie: &Arc<Mutex<Option<String>>>,
     ) {
         let mut buffer = String::new();
         let local_url_regex = Regex::new(r"^Local\s+Connection\s+URL\s*:\s*(https?://\S+)").ok();
@@ -745,7 +769,14 @@ impl CliProcessManager {
                             .and_then(|re| re.captures(line).and_then(|c| c.get(1)))
                             .map(|m| m.as_str().to_string())
                         {
-                            Self::mark_ready(app, status, ready, bootstrap_token, url);
+                            Self::mark_ready(
+                                app,
+                                status,
+                                ready,
+                                bootstrap_token,
+                                &session_cookie,
+                                url,
+                            );
                             continue;
                         }
 
@@ -760,6 +791,7 @@ impl CliProcessManager {
                                     status,
                                     ready,
                                     bootstrap_token,
+                                    &session_cookie,
                                     format!("http://localhost:{port}"),
                                 );
                                 continue;
@@ -772,6 +804,7 @@ impl CliProcessManager {
                                         status,
                                         ready,
                                         bootstrap_token,
+                                        &session_cookie,
                                         format!("http://localhost:{}", port),
                                     );
                                     continue;
@@ -790,6 +823,7 @@ impl CliProcessManager {
         status: &Arc<Mutex<CliStatus>>,
         ready: &Arc<AtomicBool>,
         bootstrap_token: &Arc<Mutex<Option<String>>>,
+        session_cookie: &Arc<Mutex<Option<String>>>,
         base_url: String,
     ) {
         ready.store(true, Ordering::SeqCst);
@@ -819,6 +853,7 @@ impl CliProcessManager {
                             log_line(&format!("failed to set session cookie: {err}"));
                             navigate_main(app, &format!("{base_url}/login"));
                         } else {
+                            *session_cookie.lock() = Some(session_id.clone());
                             navigate_main(app, &base_url);
                         }
                     }
