@@ -1,3 +1,4 @@
+import { batch as solidBatch } from "solid-js"
 import type { WorkspaceEventPayload, WorkspaceEventType } from "../../../server/src/api-types"
 import { connectWorkspaceEvents, type WorkspaceEventConnection } from "./event-transport"
 import { getLogger } from "./logger"
@@ -107,9 +108,11 @@ class ServerEvents {
     }
 
     logSse("event batch", { size: events.length })
-    for (const event of events) {
-      this.dispatch(event)
-    }
+    solidBatch(() => {
+      for (const event of events) {
+        this.dispatch(event)
+      }
+    })
   }
 
   on(type: WorkspaceEventType | "*", handler: (event: WorkspaceEventPayload) => void): () => void {
