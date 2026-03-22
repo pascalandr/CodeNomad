@@ -1,3 +1,4 @@
+import { batch } from "solid-js"
 import type {
   MessageInfo,
   MessagePartRemovedEvent,
@@ -78,11 +79,13 @@ function flushPendingSessionInfoUpdates() {
   const pending = Array.from(pendingSessionInfoUpdates)
   pendingSessionInfoUpdates.clear()
 
-  for (const entry of pending) {
-    const [instanceId, sessionId] = entry.split(":")
-    if (!instanceId || !sessionId) continue
-    updateSessionInfo(instanceId, sessionId)
-  }
+  batch(() => {
+    for (const entry of pending) {
+      const [instanceId, sessionId] = entry.split(":")
+      if (!instanceId || !sessionId) continue
+      updateSessionInfo(instanceId, sessionId)
+    }
+  })
 }
 
 function scheduleSessionInfoUpdate(instanceId: string, sessionId: string) {
