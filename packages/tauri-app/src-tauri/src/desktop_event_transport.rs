@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager, Url};
+use tauri::{AppHandle, Emitter, Manager};
 
 const EVENT_BATCH_NAME: &str = "desktop:event-batch";
 const EVENT_STATUS_NAME: &str = "desktop:event-stream-status";
@@ -137,14 +137,26 @@ enum ReaderMessage {
 }
 
 enum PendingEntry {
-    Delta { key: String, event: Value },
-    Status { key: String, event: Value },
+    Delta {
+        key: String,
+        scope: String,
+        event: Value,
+    },
+    Status {
+        key: String,
+        event: Value,
+    },
+    Snapshot {
+        key: String,
+        event: Value,
+    },
     Event(Value),
 }
 
 enum EventDeliveryPolicy {
     CoalesceDelta(String),
     CoalesceStatus(String),
+    CoalesceSnapshot(String),
     Passthrough,
 }
 
@@ -169,9 +181,15 @@ impl PendingBatch {
     fn push(&mut self, event: Value) {
         match classify_event(&event) {
             EventDeliveryPolicy::CoalesceDelta(key) => {
+                let Some(scope) = delta_scope(&event) else {
+                    self.events.push(PendingEntry::Event(event));
+                    return;
+                };
+
                 if let Some(PendingEntry::Delta {
                     key: existing_key,
                     event: existing_event,
+                    ..
                 }) = self.events.last_mut()
                 {
                     if existing_key == &key {
@@ -180,7 +198,7 @@ impl PendingBatch {
                     }
                 }
 
-                self.events.push(PendingEntry::Delta { key, event });
+                self.events.push(PendingEntry::Delta { key, scope, event });
             }
             EventDeliveryPolicy::CoalesceStatus(key) => {
                 if let Some(PendingEntry::Status {
@@ -196,6 +214,29 @@ impl PendingBatch {
 
                 self.events.push(PendingEntry::Status { key, event });
             }
+            EventDeliveryPolicy::CoalesceSnapshot(key) => {
+                if let Some(part_scope) = snapshot_superseded_delta_scope(&event) {
+                    while matches!(
+                        self.events.last(),
+                        Some(PendingEntry::Delta { scope, .. }) if scope == &part_scope
+                    ) {
+                        self.events.pop();
+                    }
+                }
+
+                if let Some(PendingEntry::Snapshot {
+                    key: existing_key,
+                    event: existing_event,
+                }) = self.events.last_mut()
+                {
+                    if existing_key == &key {
+                        *existing_event = event;
+                        return;
+                    }
+                }
+
+                self.events.push(PendingEntry::Snapshot { key, event });
+            }
             EventDeliveryPolicy::Passthrough => {
                 self.events.push(PendingEntry::Event(event));
             }
@@ -209,6 +250,7 @@ impl PendingBatch {
             .map(|entry| match entry {
                 PendingEntry::Delta { event, .. } => event,
                 PendingEntry::Status { event, .. } => event,
+                PendingEntry::Snapshot { event, .. } => event,
                 PendingEntry::Event(event) => event,
             })
             .collect()
@@ -512,17 +554,16 @@ fn resolve_session_cookie(app: &AppHandle, config: &DesktopEventStreamConfig) ->
 
 fn read_session_cookie_from_webview(
     app: &AppHandle,
-    base_url: &str,
+    _base_url: &str,
     cookie_name: &str,
 ) -> Option<String> {
-    let url = Url::parse(base_url).ok()?;
     let windows = app.webview_windows();
     let window = windows.get("main")?;
-    let cookies = window.get_cookies(url).ok()?;
+    let cookies = window.cookies().ok()?;
     cookies
         .into_iter()
-        .find(|cookie| cookie.name() == cookie_name)
-        .map(|cookie| cookie.value().to_string())
+        .find(|cookie: &tauri::webview::cookie::Cookie<'static>| cookie.name() == cookie_name)
+        .map(|cookie: tauri::webview::cookie::Cookie<'static>| cookie.value().to_string())
 }
 
 fn consume_stream(
@@ -712,13 +753,77 @@ fn classify_event(event: &Value) -> EventDeliveryPolicy {
         return EventDeliveryPolicy::CoalesceStatus(key);
     }
 
+    if let Some(key) = snapshot_key(event) {
+        return EventDeliveryPolicy::CoalesceSnapshot(key);
+    }
+
     EventDeliveryPolicy::Passthrough
 }
 
-fn delta_key(event: &Value) -> Option<String> {
+fn snapshot_key(event: &Value) -> Option<String> {
     let instance_id = event.get("instanceId")?.as_str()?;
-    let event_type = event.get("type")?.as_str()?;
-    if event_type != "instance.event" {
+    if event.get("type")?.as_str()? != "instance.event" {
+        return None;
+    }
+
+    let inner = event.get("event")?;
+    let inner_type = inner.get("type")?.as_str()?;
+    let props = inner.get("properties")?;
+
+    match inner_type {
+        "message.part.updated" => {
+            let session_id = props
+                .get("part")
+                .and_then(|part| part.get("sessionID").or_else(|| part.get("sessionId")))
+                .and_then(Value::as_str)?;
+            let message_id = props
+                .get("part")
+                .and_then(|part| part.get("messageID").or_else(|| part.get("messageId")))
+                .and_then(Value::as_str)?;
+            let part_id = props
+                .get("part")
+                .and_then(|part| part.get("id"))
+                .and_then(Value::as_str)?;
+
+            Some(format!(
+                "message.part.updated:{}:{}:{}:{}",
+                instance_id, session_id, message_id, part_id
+            ))
+        }
+        "message.updated" => {
+            let info = props.get("info")?;
+            let session_id = info
+                .get("sessionID")
+                .or_else(|| info.get("sessionId"))
+                .and_then(Value::as_str)?;
+            let message_id = info.get("id").and_then(Value::as_str)?;
+
+            Some(format!(
+                "message.updated:{}:{}:{}",
+                instance_id, session_id, message_id
+            ))
+        }
+        "session.updated" | "session.status" => {
+            let session_id = props
+                .get("info")
+                .and_then(|info| info.get("id"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    props
+                        .get("sessionID")
+                        .or_else(|| props.get("sessionId"))
+                        .and_then(Value::as_str)
+                })?;
+
+            Some(format!("{}:{}:{}", inner_type, instance_id, session_id))
+        }
+        _ => None,
+    }
+}
+
+fn delta_scope(event: &Value) -> Option<String> {
+    let instance_id = event.get("instanceId")?.as_str()?;
+    if event.get("type")?.as_str()? != "instance.event" {
         return None;
     }
 
@@ -741,11 +846,46 @@ fn delta_key(event: &Value) -> Option<String> {
         .get("partID")
         .or_else(|| props.get("partId"))
         .and_then(Value::as_str)?;
-    let field = props.get("field")?.as_str()?;
 
     Some(format!(
-        "{}:{}:{}:{}:{}",
-        instance_id, session_id, message_id, part_id, field
+        "message.part:{}:{}:{}:{}",
+        instance_id, session_id, message_id, part_id
+    ))
+}
+
+fn delta_key(event: &Value) -> Option<String> {
+    let scope = delta_scope(event)?;
+    let props = event.get("event")?.get("properties")?;
+    let field = props.get("field")?.as_str()?;
+
+    Some(format!("{}:{}", scope, field))
+}
+
+fn snapshot_superseded_delta_scope(event: &Value) -> Option<String> {
+    let instance_id = event.get("instanceId")?.as_str()?;
+    if event.get("type")?.as_str()? != "instance.event" {
+        return None;
+    }
+
+    let inner = event.get("event")?;
+    if inner.get("type")?.as_str()? != "message.part.updated" {
+        return None;
+    }
+
+    let part = inner.get("properties")?.get("part")?;
+    let session_id = part
+        .get("sessionID")
+        .or_else(|| part.get("sessionId"))
+        .and_then(Value::as_str)?;
+    let message_id = part
+        .get("messageID")
+        .or_else(|| part.get("messageId"))
+        .and_then(Value::as_str)?;
+    let part_id = part.get("id")?.as_str()?;
+
+    Some(format!(
+        "message.part:{}:{}:{}:{}",
+        instance_id, session_id, message_id, part_id
     ))
 }
 
@@ -816,6 +956,25 @@ mod tests {
         })
     }
 
+    fn message_part_updated_event(text: &str) -> Value {
+        json!({
+            "type": "instance.event",
+            "instanceId": "inst-1",
+            "event": {
+                "type": "message.part.updated",
+                "properties": {
+                    "part": {
+                        "id": "part-1",
+                        "type": "text",
+                        "text": text,
+                        "sessionID": "sess-1",
+                        "messageID": "msg-1"
+                    }
+                }
+            }
+        })
+    }
+
     #[test]
     fn coalesces_message_part_delta_events() {
         let mut pending = PendingBatch::default();
@@ -847,6 +1006,76 @@ mod tests {
         let events = pending.take_events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["status"].as_str(), Some("connected"));
+    }
+
+    #[test]
+    fn last_write_wins_for_consecutive_snapshot_events() {
+        let mut pending = PendingBatch::default();
+        pending.push(message_part_updated_event("Hello"));
+        pending.push(message_part_updated_event("Hello world"));
+
+        let events = pending.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["event"]["properties"]["part"]["text"].as_str(),
+            Some("Hello world")
+        );
+    }
+
+    #[test]
+    fn interleaved_snapshot_keys_keep_order() {
+        let mut pending = PendingBatch::default();
+        pending.push(message_part_updated_event("A1"));
+        pending.push(json!({
+            "type": "instance.event",
+            "instanceId": "inst-1",
+            "event": {
+                "type": "message.part.updated",
+                "properties": {
+                    "part": {
+                        "id": "part-2",
+                        "type": "text",
+                        "text": "B1",
+                        "sessionID": "sess-1",
+                        "messageID": "msg-1"
+                    }
+                }
+            }
+        }));
+        pending.push(message_part_updated_event("A2"));
+
+        let events = pending.take_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events[0]["event"]["properties"]["part"]["id"].as_str(),
+            Some("part-1")
+        );
+        assert_eq!(
+            events[1]["event"]["properties"]["part"]["id"].as_str(),
+            Some("part-2")
+        );
+        assert_eq!(
+            events[2]["event"]["properties"]["part"]["text"].as_str(),
+            Some("A2")
+        );
+    }
+
+    #[test]
+    fn snapshot_replaces_trailing_deltas_for_same_part() {
+        let mut pending = PendingBatch::default();
+        pending.push(delta_event("Hello"));
+        pending.push(message_part_updated_event("Hello world"));
+
+        let events = pending.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["event"]["type"].as_str(),
+            Some("message.part.updated")
+        );
+        assert_eq!(
+            events[0]["event"]["properties"]["part"]["text"].as_str(),
+            Some("Hello world")
+        );
     }
 
     #[test]
