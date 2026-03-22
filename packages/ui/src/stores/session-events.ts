@@ -341,39 +341,41 @@ function handleMessageUpdate(instanceId: string, event: MessageUpdateEvent | Mes
     const createdAt = typeof messageInfo?.time?.created === "number" ? messageInfo.time.created : Date.now()
 
 
-    let record = store.getMessage(messageId)
-    if (!record) {
-      const pendingId = findPendingSyntheticMessageId(store, sessionId, role)
-      if (pendingId && pendingId !== messageId) {
-        replaceMessageIdV2(instanceId, pendingId, messageId, { clearParts: role === "user" })
-        record = store.getMessage(messageId)
+    batch(() => {
+      let record = store.getMessage(messageId)
+      if (!record) {
+        const pendingId = findPendingSyntheticMessageId(store, sessionId, role)
+        if (pendingId && pendingId !== messageId) {
+          replaceMessageIdV2(instanceId, pendingId, messageId, { clearParts: role === "user" })
+          record = store.getMessage(messageId)
+        }
       }
-    }
 
-    if (!record) {
-      store.upsertMessage({
-        id: messageId,
-        sessionId,
-        role,
-        status: "streaming",
-        createdAt,
-        updatedAt: createdAt,
-        isEphemeral: true,
-      })
-    }
+      if (!record) {
+        store.upsertMessage({
+          id: messageId,
+          sessionId,
+          role,
+          status: "streaming",
+          createdAt,
+          updatedAt: createdAt,
+          isEphemeral: true,
+        })
+      }
 
-    if (messageInfo) {
-      upsertMessageInfoV2(instanceId, messageInfo, { status: "streaming" })
-    }
- 
-    applyPartUpdateV2(instanceId, { ...part, sessionID: sessionId, messageID: messageId })
+      if (messageInfo) {
+        upsertMessageInfoV2(instanceId, messageInfo, { status: "streaming" })
+      }
 
-    if (part.type === "tool" && part.tool === "question") {
-      // Questions can arrive before their tool part exists; re-link now.
-      reconcilePendingQuestionsV2(instanceId, sessionId)
-    }
+      applyPartUpdateV2(instanceId, { ...part, sessionID: sessionId, messageID: messageId })
 
-    scheduleSessionInfoUpdate(instanceId, sessionId)
+      if (part.type === "tool" && part.tool === "question") {
+        // Questions can arrive before their tool part exists; re-link now.
+        reconcilePendingQuestionsV2(instanceId, sessionId)
+      }
+
+      scheduleSessionInfoUpdate(instanceId, sessionId)
+    })
   } else if (event.type === "message.updated") {
     const info = event.properties?.info
     if (!info) return
@@ -392,43 +394,45 @@ function handleMessageUpdate(instanceId: string, event: MessageUpdateEvent | Mes
             ? timeInfo.created
             : Date.now()
 
-    withSession(instanceId, sessionId, (session) => {
-      const currentUpdated = session.time?.updated ?? 0
-      if (nextUpdated <= currentUpdated) return false
-      session.time = { ...(session.time ?? {}), updated: nextUpdated }
-    })
-
-    const store = messageStoreBus.getOrCreate(instanceId)
-
-    const role: MessageRole = info.role === "user" ? "user" : "assistant"
-    const hasError = Boolean((info as any).error)
-    const status: MessageStatus = hasError ? "error" : "complete"
-
-    let record = store.getMessage(messageId)
-    if (!record) {
-      const pendingId = findPendingSyntheticMessageId(store, sessionId, role)
-      if (pendingId && pendingId !== messageId) {
-        replaceMessageIdV2(instanceId, pendingId, messageId, { clearParts: role === "user" })
-        record = store.getMessage(messageId)
-      }
-    }
-
-    if (!record) {
-      const createdAt = info.time?.created ?? Date.now()
-      const endAt = (info.time as { end?: number } | undefined)?.end
-      store.upsertMessage({
-        id: messageId,
-        sessionId,
-        role,
-        status,
-        createdAt,
-        updatedAt: endAt ?? createdAt,
+    batch(() => {
+      withSession(instanceId, sessionId, (session) => {
+        const currentUpdated = session.time?.updated ?? 0
+        if (nextUpdated <= currentUpdated) return false
+        session.time = { ...(session.time ?? {}), updated: nextUpdated }
       })
-    }
 
-    upsertMessageInfoV2(instanceId, info, { status, bumpRevision: true })
+      const store = messageStoreBus.getOrCreate(instanceId)
 
-    scheduleSessionInfoUpdate(instanceId, sessionId)
+      const role: MessageRole = info.role === "user" ? "user" : "assistant"
+      const hasError = Boolean((info as any).error)
+      const status: MessageStatus = hasError ? "error" : "complete"
+
+      let record = store.getMessage(messageId)
+      if (!record) {
+        const pendingId = findPendingSyntheticMessageId(store, sessionId, role)
+        if (pendingId && pendingId !== messageId) {
+          replaceMessageIdV2(instanceId, pendingId, messageId, { clearParts: role === "user" })
+          record = store.getMessage(messageId)
+        }
+      }
+
+      if (!record) {
+        const createdAt = info.time?.created ?? Date.now()
+        const endAt = (info.time as { end?: number } | undefined)?.end
+        store.upsertMessage({
+          id: messageId,
+          sessionId,
+          role,
+          status,
+          createdAt,
+          updatedAt: endAt ?? createdAt,
+        })
+      }
+
+      upsertMessageInfoV2(instanceId, info, { status, bumpRevision: true })
+
+      scheduleSessionInfoUpdate(instanceId, sessionId)
+    })
   }
 }
 
