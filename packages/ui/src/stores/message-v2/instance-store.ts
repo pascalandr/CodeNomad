@@ -1099,9 +1099,12 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
    function clearSession(sessionId: string) {
      if (!sessionId) return
 
-    const messageIds = Object.values(state.messages)
-      .filter((record) => record.sessionId === sessionId)
-      .map((record) => record.id)
+    const session = state.sessions[sessionId]
+    const messageIds = session?.messageIds?.length
+      ? [...session.messageIds]
+      : Object.values(state.messages)
+          .filter((record) => record.sessionId === sessionId)
+          .map((record) => record.id)
  
     storeLog.info("Clearing session data", { instanceId, sessionId, messageCount: messageIds.length })
     clearRecordDisplayCacheForMessages(instanceId, messageIds)
