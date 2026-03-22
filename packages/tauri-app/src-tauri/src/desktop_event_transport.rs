@@ -3,7 +3,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
@@ -18,6 +18,8 @@ const MAX_BATCH_EVENTS: usize = 256;
 const DEFAULT_RECONNECT_INITIAL_DELAY_MS: u64 = 1_000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS: u64 = 10_000;
 const DEFAULT_RECONNECT_MULTIPLIER: f64 = 2.0;
+const STREAM_CONNECT_TIMEOUT_MS: u64 = 5_000;
+const STREAM_IO_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DesktopEventStreamConfig {
@@ -505,11 +507,15 @@ fn open_stream(
     app: &AppHandle,
     config: &DesktopEventStreamConfig,
 ) -> Result<Response, OpenStreamError> {
-    let client = Client::builder().build().map_err(|error| OpenStreamError {
-        kind: OpenStreamErrorKind::Transport,
-        message: error.to_string(),
-        status_code: None,
-    })?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_millis(STREAM_CONNECT_TIMEOUT_MS))
+        .timeout(Duration::from_millis(STREAM_IO_TIMEOUT_MS))
+        .build()
+        .map_err(|error| OpenStreamError {
+            kind: OpenStreamErrorKind::Transport,
+            message: error.to_string(),
+            status_code: None,
+        })?;
 
     let mut request = client
         .get(&config.events_url)
@@ -682,6 +688,10 @@ fn read_sse(
                 }
             }
             Err(error) => {
+                if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) {
+                    continue;
+                }
+
                 if let Some(event) = parse_sse_payload(&data_lines) {
                     let _ = tx.send(ReaderMessage::Event(event));
                 }
@@ -1169,5 +1179,17 @@ mod tests {
         assert_eq!(compute_reconnect_delay_ms(2, &policy), 200);
         assert_eq!(compute_reconnect_delay_ms(3, &policy), 400);
         assert_eq!(compute_reconnect_delay_ms(4, &policy), 500);
+    }
+
+    #[test]
+    fn reader_timeouts_are_nonfatal() {
+        assert!(matches!(
+            ErrorKind::TimedOut,
+            ErrorKind::TimedOut | ErrorKind::WouldBlock
+        ));
+        assert!(matches!(
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut | ErrorKind::WouldBlock
+        ));
     }
 }
