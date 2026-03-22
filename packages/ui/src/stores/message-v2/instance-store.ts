@@ -220,6 +220,7 @@ export interface InstanceMessageStore {
   getScrollSnapshot: (sessionId: string, scope: string) => ScrollSnapshot | undefined
   getSessionRevision: (sessionId: string) => number
   getSessionMessageIds: (sessionId: string) => string[]
+  getPendingSyntheticMessageId: (sessionId: string, role: MessageRecord["role"]) => string | undefined
   resolveToolCallPartId: (messageId: string, callId?: string) => string | undefined
   // Index of the most recent message in the session that contains a compaction part.
   // Returns -1 if there has been no compaction.
@@ -241,8 +242,54 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
   const pendingPermissionIdsBySession = new Map<string, Set<string>>()
   const pendingQuestionEntriesById = new Map<string, QuestionEntry>()
   const pendingQuestionIdsBySession = new Map<string, Set<string>>()
+  const pendingSyntheticMessageIdsBySessionRole = new Map<string, string[]>()
+  const pendingSyntheticKeyByMessageId = new Map<string, string>()
   const pendingSessionRevisionBumps = new Set<string>()
   let sessionRevisionFlushQueued = false
+
+  function makePendingSyntheticKey(sessionId: string, role: MessageRecord["role"]) {
+    return `${sessionId}:${role}`
+  }
+
+  function isPendingSyntheticRecord(record: MessageRecord | undefined) {
+    return Boolean(record?.isEphemeral && record?.status === "sending")
+  }
+
+  function removePendingSyntheticMessageId(messageId: string | undefined) {
+    if (!messageId) return
+    const key = pendingSyntheticKeyByMessageId.get(messageId)
+    if (!key) return
+    pendingSyntheticKeyByMessageId.delete(messageId)
+    const existing = pendingSyntheticMessageIdsBySessionRole.get(key)
+    if (!existing) return
+    const next = existing.filter((id) => id !== messageId)
+    if (next.length === 0) {
+      pendingSyntheticMessageIdsBySessionRole.delete(key)
+      return
+    }
+    pendingSyntheticMessageIdsBySessionRole.set(key, next)
+  }
+
+  function addPendingSyntheticRecord(record: MessageRecord | undefined) {
+    if (!record || !isPendingSyntheticRecord(record)) return
+    const key = makePendingSyntheticKey(record.sessionId, record.role)
+    const existing = pendingSyntheticMessageIdsBySessionRole.get(key) ?? []
+    if (!existing.includes(record.id)) {
+      pendingSyntheticMessageIdsBySessionRole.set(key, [...existing, record.id])
+    }
+    pendingSyntheticKeyByMessageId.set(record.id, key)
+  }
+
+  function syncPendingSyntheticRecord(nextRecord: MessageRecord | undefined, previousMessageId?: string) {
+    removePendingSyntheticMessageId(previousMessageId ?? nextRecord?.id)
+    addPendingSyntheticRecord(nextRecord)
+  }
+
+  function getPendingSyntheticMessageId(sessionId: string, role: MessageRecord["role"]) {
+    if (!sessionId) return undefined
+    const ids = pendingSyntheticMessageIdsBySessionRole.get(makePendingSyntheticKey(sessionId, role))
+    return ids?.[0]
+  }
 
   function addIdToSessionIndex(index: Map<string, Set<string>>, sessionId: string | undefined, entryId: string) {
     if (!sessionId || !entryId) return
@@ -554,6 +601,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
 
     Object.entries(normalizedRecords).forEach(([id, record]) => {
       clearToolCallPartIndexForMessage(state.messages[id])
+      syncPendingSyntheticRecord(record, id)
       nextMessages[id] = record
       indexToolCallPartsForMessage(record)
     })
@@ -626,9 +674,9 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     const normalizedParts = normalizeParts(input.id, input.parts)
     const shouldBump = Boolean(input.bumpRevision || normalizedParts)
     const now = Date.now()
+    const previousRecord = state.messages[input.id]
 
     let nextRecord: MessageRecord | undefined
-    const previousRecord = state.messages[input.id]
 
     setState("messages", input.id, (previous) => {
       const revision = previous ? previous.revision + (shouldBump ? 1 : 0) : 0
@@ -649,6 +697,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     })
 
     if (nextRecord) {
+      syncPendingSyntheticRecord(nextRecord, previousRecord?.id)
       if (normalizedParts) {
         clearToolCallPartIndexForMessage(previousRecord)
         indexToolCallPartsForMessage(nextRecord)
@@ -841,6 +890,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
 
     clearRecordDisplayCacheForMessages(instanceId, [messageId])
     clearToolCallPartIndexForMessage(record)
+    removePendingSyntheticMessageId(messageId)
 
     batch(() => {
       sessionIds.forEach((sessionId) => {
@@ -954,7 +1004,9 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     }
 
     clearToolCallPartIndexForMessage(existing)
+    removePendingSyntheticMessageId(options.oldId)
     indexToolCallPartsForMessage(cloned)
+    addPendingSyntheticRecord(cloned)
 
     setState("messages", options.newId, cloned)
     setState("messages", (prev) => {
@@ -1202,6 +1254,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     if (removedIds.length === 0) return
 
     removedIds.forEach((id) => clearToolCallPartIndexForMessage(state.messages[id]))
+    removedIds.forEach((id) => removePendingSyntheticMessageId(id))
 
     setState("sessions", sessionId, "messageIds", keptIds)
 
@@ -1290,6 +1343,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     storeLog.info("Clearing session data", { instanceId, sessionId, messageCount: messageIds.length })
     clearRecordDisplayCacheForMessages(instanceId, messageIds)
     messageIds.forEach((id) => clearToolCallPartIndexForMessage(state.messages[id]))
+    messageIds.forEach((id) => removePendingSyntheticMessageId(id))
  
     batch(() => {
       setState("messages", (prev) => {
@@ -1379,6 +1433,8 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
       pendingPermissionIdsBySession.clear()
       pendingQuestionEntriesById.clear()
       pendingQuestionIdsBySession.clear()
+      pendingSyntheticMessageIdsBySessionRole.clear()
+      pendingSyntheticKeyByMessageId.clear()
       messageInfoCache.clear()
        setState(reconcile(createInitialState(instanceId)))
      }
@@ -1415,8 +1471,9 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
      getSessionUsage,
      setScrollSnapshot,
      getScrollSnapshot,
-       getSessionRevision: getSessionRevisionValue,
+        getSessionRevision: getSessionRevisionValue,
         getSessionMessageIds: (sessionId: string) => state.sessions[sessionId]?.messageIds ?? [],
+        getPendingSyntheticMessageId,
         resolveToolCallPartId,
         getLastCompactionMessageIndex,
        getMessage: (messageId: string) => state.messages[messageId],

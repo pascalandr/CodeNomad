@@ -303,17 +303,7 @@ function findPendingSyntheticMessageId(
   sessionId: string,
   role: MessageRole,
 ): string | undefined {
-  const messageIds = store.getSessionMessageIds(sessionId)
-  for (const messageId of messageIds) {
-    const record = store.getMessage(messageId)
-    if (!record) continue
-    if (record.sessionId !== sessionId) continue
-    if (record.role !== role) continue
-    if (record.status !== "sending") continue
-    if (!record.isEphemeral) continue
-    return record.id
-  }
-  return undefined
+  return store.getPendingSyntheticMessageId(sessionId, role)
 }
 
 function handleMessageUpdate(instanceId: string, event: MessageUpdateEvent | MessagePartUpdatedEvent): void {
