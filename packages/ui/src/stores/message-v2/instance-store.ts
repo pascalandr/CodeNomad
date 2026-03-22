@@ -205,9 +205,11 @@ export interface InstanceMessageStore {
   setMessageInfo: (messageId: string, info: MessageInfo) => void
   getMessageInfo: (messageId: string) => MessageInfo | undefined
   upsertPermission: (entry: PermissionEntry) => void
+  getPendingPermissionEntries: (sessionId?: string) => PermissionEntry[]
   removePermission: (permissionId: string) => void
   getPermissionState: (messageId?: string, partId?: string) => { entry: PermissionEntry; active: boolean } | null
   upsertQuestion: (entry: QuestionEntry) => void
+  getPendingQuestionEntries: (sessionId?: string) => QuestionEntry[]
   removeQuestion: (requestId: string) => void
   getQuestionState: (messageId?: string, partId?: string) => { entry: QuestionEntry; active: boolean } | null
   setSessionRevert: (sessionId: string, revert?: SessionRecord["revert"] | null) => void
@@ -235,8 +237,67 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
 
   const messageInfoCache = new Map<string, MessageInfo>()
   const toolCallPartIndex = new Map<string, string>()
+  const pendingPermissionEntriesById = new Map<string, PermissionEntry>()
+  const pendingPermissionIdsBySession = new Map<string, Set<string>>()
+  const pendingQuestionEntriesById = new Map<string, QuestionEntry>()
+  const pendingQuestionIdsBySession = new Map<string, Set<string>>()
   const pendingSessionRevisionBumps = new Set<string>()
   let sessionRevisionFlushQueued = false
+
+  function addIdToSessionIndex(index: Map<string, Set<string>>, sessionId: string | undefined, entryId: string) {
+    if (!sessionId || !entryId) return
+    const set = index.get(sessionId) ?? new Set<string>()
+    set.add(entryId)
+    index.set(sessionId, set)
+  }
+
+  function removeIdFromSessionIndex(index: Map<string, Set<string>>, sessionId: string | undefined, entryId: string) {
+    if (!sessionId || !entryId) return
+    const set = index.get(sessionId)
+    if (!set) return
+    set.delete(entryId)
+    if (set.size === 0) {
+      index.delete(sessionId)
+    }
+  }
+
+  function updatePermissionPendingIndex(previous: PermissionEntry | undefined, next: PermissionEntry) {
+    const permissionId = next.permission?.id
+    if (!permissionId) return
+    if (previous) {
+      removeIdFromSessionIndex(pendingPermissionIdsBySession, previous.sessionId, permissionId)
+    }
+    pendingPermissionEntriesById.set(permissionId, next)
+    if (!next.partId) {
+      addIdToSessionIndex(pendingPermissionIdsBySession, next.sessionId, permissionId)
+    }
+  }
+
+  function removePermissionPendingIndex(entry: PermissionEntry | undefined) {
+    const permissionId = entry?.permission?.id
+    if (!permissionId) return
+    removeIdFromSessionIndex(pendingPermissionIdsBySession, entry?.sessionId, permissionId)
+    pendingPermissionEntriesById.delete(permissionId)
+  }
+
+  function updateQuestionPendingIndex(previous: QuestionEntry | undefined, next: QuestionEntry) {
+    const requestId = next.request?.id
+    if (!requestId) return
+    if (previous) {
+      removeIdFromSessionIndex(pendingQuestionIdsBySession, previous.sessionId, requestId)
+    }
+    pendingQuestionEntriesById.set(requestId, next)
+    if (!next.partId) {
+      addIdToSessionIndex(pendingQuestionIdsBySession, next.sessionId, requestId)
+    }
+  }
+
+  function removeQuestionPendingIndex(entry: QuestionEntry | undefined) {
+    const requestId = entry?.request?.id
+    if (!requestId) return
+    removeIdFromSessionIndex(pendingQuestionIdsBySession, entry?.sessionId, requestId)
+    pendingQuestionEntriesById.delete(requestId)
+  }
 
   function getToolCallId(part: ClientPart | undefined): string | undefined {
     if (!part || part.type !== "tool") {
@@ -976,6 +1037,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
   }
 
   function upsertPermission(entry: PermissionEntry) {
+    const previous = pendingPermissionEntriesById.get(entry.permission.id)
     const messageKey = entry.messageId ?? "__global__"
     const partKey = entry.partId ?? entry.permission?.id ?? "__global__"
 
@@ -995,9 +1057,31 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
         }
       }),
     )
+    updatePermissionPendingIndex(previous, entry)
+  }
+
+  function getPendingPermissionEntries(sessionId?: string) {
+    if (!sessionId) {
+      return state.permissions.queue.filter((entry) => !entry?.partId)
+    }
+
+    const ids = pendingPermissionIdsBySession.get(sessionId)
+    if (!ids || ids.size === 0) {
+      return []
+    }
+
+    const result: PermissionEntry[] = []
+    ids.forEach((id) => {
+      const entry = pendingPermissionEntriesById.get(id)
+      if (entry && !entry.partId) {
+        result.push(entry)
+      }
+    })
+    return result
   }
 
   function removePermission(permissionId: string) {
+    const previous = pendingPermissionEntriesById.get(permissionId)
     setState(
       "permissions",
       produce((draft) => {
@@ -1018,6 +1102,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
         })
       }),
     )
+    removePermissionPendingIndex(previous)
   }
 
   function getPermissionState(messageId?: string, partId?: string) {
@@ -1030,6 +1115,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
   }
 
   function upsertQuestion(entry: QuestionEntry) {
+    const previous = pendingQuestionEntriesById.get(entry.request.id)
     const messageKey = entry.messageId ?? "__global__"
     const partKey = entry.partId ?? entry.request?.id ?? "__global__"
 
@@ -1049,9 +1135,31 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
         }
       }),
     )
+    updateQuestionPendingIndex(previous, entry)
+  }
+
+  function getPendingQuestionEntries(sessionId?: string) {
+    if (!sessionId) {
+      return state.questions.queue.filter((entry) => !entry?.partId)
+    }
+
+    const ids = pendingQuestionIdsBySession.get(sessionId)
+    if (!ids || ids.size === 0) {
+      return []
+    }
+
+    const result: QuestionEntry[] = []
+    ids.forEach((id) => {
+      const entry = pendingQuestionEntriesById.get(id)
+      if (entry && !entry.partId) {
+        result.push(entry)
+      }
+    })
+    return result
   }
 
   function removeQuestion(requestId: string) {
+    const previous = pendingQuestionEntriesById.get(requestId)
     setState(
       "questions",
       produce((draft) => {
@@ -1072,6 +1180,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
         })
       }),
     )
+    removeQuestionPendingIndex(previous)
   }
 
   function getQuestionState(messageId?: string, partId?: string) {
@@ -1265,7 +1374,11 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
 
  
     function clearInstance() {
-      toolCallPartIndex.clear()
+     toolCallPartIndex.clear()
+      pendingPermissionEntriesById.clear()
+      pendingPermissionIdsBySession.clear()
+      pendingQuestionEntriesById.clear()
+      pendingQuestionIdsBySession.clear()
       messageInfoCache.clear()
        setState(reconcile(createInitialState(instanceId)))
      }
@@ -1287,11 +1400,13 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
      replaceMessageId,
      setMessageInfo,
      getMessageInfo,
-      upsertPermission,
-      removePermission,
-      getPermissionState,
-      upsertQuestion,
-      removeQuestion,
+       upsertPermission,
+       getPendingPermissionEntries,
+       removePermission,
+       getPermissionState,
+       upsertQuestion,
+       getPendingQuestionEntries,
+       removeQuestion,
       getQuestionState,
 
      setSessionRevert,
