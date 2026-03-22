@@ -233,6 +233,8 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
   const TODO_TOOL_NAME = "todowrite"
 
   const messageInfoCache = new Map<string, MessageInfo>()
+  const pendingSessionRevisionBumps = new Set<string>()
+  let sessionRevisionFlushQueued = false
 
   function getLastCompactionMessageIndex(sessionId: string): number {
     if (!sessionId) return -1
@@ -300,6 +302,33 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
   function bumpSessionRevision(sessionId: string) {
     if (!sessionId) return
     setState("sessionRevisions", sessionId, (value = 0) => value + 1)
+  }
+
+  function flushPendingSessionRevisionBumps() {
+    sessionRevisionFlushQueued = false
+    if (pendingSessionRevisionBumps.size === 0) {
+      return
+    }
+
+    const pending = Array.from(pendingSessionRevisionBumps)
+    pendingSessionRevisionBumps.clear()
+
+    batch(() => {
+      for (const sessionId of pending) {
+        bumpSessionRevision(sessionId)
+      }
+    })
+  }
+
+  function scheduleSessionRevisionBump(sessionId: string) {
+    if (!sessionId) return
+    pendingSessionRevisionBumps.add(sessionId)
+    if (sessionRevisionFlushQueued) {
+      return
+    }
+
+    sessionRevisionFlushQueued = true
+    queueMicrotask(flushPendingSessionRevisionBumps)
   }
 
   function getSessionRevisionValue(sessionId: string) {
@@ -450,7 +479,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
         maybeUpdateLatestTodoFromRecord(record)
       })
 
-      bumpSessionRevision(sessionId)
+      scheduleSessionRevisionBump(sessionId)
     })
   }
 
@@ -516,7 +545,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
 
     insertMessageIntoSession(input.sessionId, input.id)
     flushPendingParts(input.id)
-    bumpSessionRevision(input.sessionId)
+    scheduleSessionRevisionBump(input.sessionId)
   }
 
   function bufferPendingPart(entry: PendingPartEntry) {
@@ -623,7 +652,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
   
     // Any part update can change the rendered height of the message
     // list, so we treat it as a session revision for scroll purposes.
-    bumpSessionRevision(message.sessionId)
+    scheduleSessionRevisionBump(message.sessionId)
   }
 
   function applyPartDelta(input: {
@@ -668,7 +697,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     )
 
     if (applied && (input.bumpSessionRevision ?? true)) {
-      bumpSessionRevision(message.sessionId)
+      scheduleSessionRevisionBump(message.sessionId)
     }
   }
 
@@ -816,7 +845,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
       affectedSessions.add(session.id)
     })
 
-    affectedSessions.forEach((sessionId) => bumpSessionRevision(sessionId))
+    affectedSessions.forEach((sessionId) => scheduleSessionRevisionBump(sessionId))
 
     const infoEntry = messageInfoCache.get(options.oldId)
     if (infoEntry) {
