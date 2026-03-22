@@ -1,14 +1,13 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, on, untrack, type Component, type Accessor } from "solid-js"
 import MessagePreview from "./message-preview"
 import { messageStoreBus } from "../stores/message-v2/bus"
-import type { ClientPart } from "../types/message"
 import type { MessageRecord } from "../stores/message-v2/types"
-import { buildRecordDisplayData } from "../stores/message-v2/record-display-cache"
 import { getPartCharCount } from "../lib/token-utils"
 import { getToolIcon } from "./tool-call/utils"
 import { User as UserIcon, Bot as BotIcon, FoldVertical, ShieldAlert } from "lucide-solid"
 import { useI18n } from "../lib/i18n"
 import type { DeleteHoverState } from "../types/delete-hover"
+import { projectMessageEntries } from "./message-render-projection"
 
 export type TimelineSegmentType = "user" | "assistant" | "tool" | "compaction"
 
@@ -54,8 +53,6 @@ const LONG_PRESS_MS = 500
 const JITTER_THRESHOLD = 10
 const ABSOLUTE_TOKEN_CAP = 10000
 
-type ToolCallPart = Extract<ClientPart, { type: "tool" }>
-
 interface PendingSegment {
   type: TimelineSegmentType
   texts: string[]
@@ -72,73 +69,9 @@ function truncateText(value: string): string {
   return `${value.slice(0, MAX_TOOLTIP_LENGTH - 1).trimEnd()}…`
 }
 
-function collectReasoningText(part: ClientPart): string {
-  const stringifySegment = (segment: unknown): string => {
-    if (typeof segment === "string") {
-      return segment
-    }
-    if (segment && typeof segment === "object") {
-      const obj = segment as { text?: unknown; value?: unknown; content?: unknown[] }
-      const parts: string[] = []
-      if (typeof obj.text === "string") {
-        parts.push(obj.text)
-      }
-      if (typeof obj.value === "string") {
-        parts.push(obj.value)
-      }
-      if (Array.isArray(obj.content)) {
-        parts.push(obj.content.map((entry) => stringifySegment(entry)).join("\n"))
-      }
-      return parts.filter(Boolean).join("\n")
-    }
-    return ""
-  }
-
-  if (typeof (part as any)?.text === "string") {
-    return (part as any).text
-  }
-  if (Array.isArray((part as any)?.content)) {
-    return (part as any).content.map((entry: unknown) => stringifySegment(entry)).join("\n")
-  }
-  return ""
-}
-
-function collectTextFromPart(part: ClientPart, t: (key: string, params?: Record<string, unknown>) => string): string {
-  if (!part) return ""
-  if (typeof (part as any).text === "string") {
-    return (part as any).text as string
-  }
-  if (part.type === "reasoning") {
-    return collectReasoningText(part)
-  }
-  if (Array.isArray((part as any)?.content)) {
-    return ((part as any).content as unknown[])
-      .map((entry) => (typeof entry === "string" ? entry : ""))
-      .filter(Boolean)
-      .join("\n")
-  }
-  if (part.type === "file") {
-    const filename = (part as any)?.filename
-    return typeof filename === "string" && filename.length > 0
-      ? t("messageTimeline.text.filePrefix", { filename })
-      : t("messageTimeline.text.attachment")
-  }
-  return ""
-}
-
-function getToolTitle(part: ToolCallPart, t: (key: string, params?: Record<string, unknown>) => string): string {
-  const metadata = (((part as unknown as { state?: { metadata?: unknown } })?.state?.metadata) || {}) as { title?: unknown }
-  const title = typeof metadata.title === "string" && metadata.title.length > 0 ? metadata.title : undefined
-  if (title) return title
-  if (typeof part.tool === "string" && part.tool.length > 0) {
-    return part.tool
-  }
-  return t("messageTimeline.tool.fallbackLabel")
-}
-
-function getToolTypeLabel(part: ToolCallPart, t: (key: string, params?: Record<string, unknown>) => string): string {
-  if (typeof part.tool === "string" && part.tool.trim().length > 0) {
-    return part.tool.trim().slice(0, 4)
+function getToolTypeLabel(toolName: string, t: (key: string, params?: Record<string, unknown>) => string): string {
+  if (toolName.trim().length > 0) {
+    return toolName.trim().slice(0, 4)
   }
   return t("messageTimeline.tool.fallbackLabel").slice(0, 4)
 }
@@ -170,8 +103,8 @@ export function buildTimelineSegments(
   t: (key: string, params?: Record<string, unknown>) => string,
 ): TimelineSegment[] {
   if (!record) return []
-  const { orderedParts } = buildRecordDisplayData(instanceId, record)
-  if (!orderedParts || orderedParts.length === 0) {
+  const entries = projectMessageEntries(instanceId, record, t)
+  if (entries.length === 0) {
     return []
   }
 
@@ -230,74 +163,63 @@ export function buildTimelineSegments(
 
   const defaultContentType: TimelineSegmentType = record.role === "user" ? "user" : "assistant"
 
-  for (const part of orderedParts) {
-    if (!part || typeof part !== "object") continue
-
-    if (part.type === "tool") {
+  for (const entry of entries) {
+    if (entry.kind === "tool") {
       flushPending()
-      const toolPart = part as ToolCallPart
-      const partId = typeof toolPart.id === "string" ? toolPart.id : ""
-      const title = getToolTitle(toolPart, t)
       result.push({
         id: `${record.id}:${segmentIndex}`,
         messageId: record.id,
         type: "tool",
-        label: getToolTypeLabel(toolPart, t) || segmentLabel("tool"),
-        tooltip: formatToolTooltip([title], t),
-        shortLabel: getToolIcon(typeof toolPart.tool === "string" ? toolPart.tool : "tool"),
-        toolPartIds: partId ? [partId] : undefined,
-        totalChars: getPartCharCount(part),
+        label: getToolTypeLabel(entry.toolName, t) || segmentLabel("tool"),
+        tooltip: formatToolTooltip([entry.toolTitle], t),
+        shortLabel: getToolIcon(entry.toolName || "tool"),
+        toolPartIds: entry.partId ? [entry.partId] : undefined,
+        totalChars: entry.totalChars,
       })
       segmentIndex += 1
       continue
     }
 
-    if (part.type === "reasoning") {
-      const text = collectReasoningText(part)
-      if (text.trim().length === 0) continue
+    if (entry.kind === "reasoning") {
+      if (entry.text.trim().length === 0) continue
       const target = ensureSegment(defaultContentType)
       if (target) {
-        target.reasoningTexts.push(text)
-        if (typeof (part as any).id === "string" && (part as any).id.length > 0) {
-          target.partIds.push((part as any).id)
-        }
-        target.totalChars += getPartCharCount(part)
+        target.reasoningTexts.push(entry.text)
+        if (entry.partId) target.partIds.push(entry.partId)
+        target.totalChars += entry.totalChars
       }
       continue
     }
 
-    if (part.type === "compaction") {
+    if (entry.kind === "compaction") {
       flushPending()
-      const isAuto = Boolean((part as any)?.auto)
-      const partId = typeof (part as any)?.id === "string" ? ((part as any).id as string) : ""
       result.push({
         id: `${record.id}:${segmentIndex}`,
         messageId: record.id,
         type: "compaction",
         label: segmentLabel("compaction"),
-        tooltip: isAuto ? t("messageTimeline.tooltip.compaction.auto") : t("messageTimeline.tooltip.compaction.manual"),
-        variant: isAuto ? "auto" : "manual",
-        partId,
+        tooltip: entry.auto ? t("messageTimeline.tooltip.compaction.auto") : t("messageTimeline.tooltip.compaction.manual"),
+        variant: entry.auto ? "auto" : "manual",
+        partId: entry.partId,
         totalChars: 0,
       })
       segmentIndex += 1
       continue
     }
 
-    if (part.type === "step-start" || part.type === "step-finish") {
+    if (entry.kind === "step-finish") {
       continue
     }
 
-    const text = collectTextFromPart(part, t)
-    if (text.trim().length === 0) continue
+    if (entry.kind !== "content") continue
+    if (entry.texts.length === 0) continue
+
     const target = ensureSegment(defaultContentType)
     if (target) {
-      target.texts.push(text)
-      target.hasPrimaryText = true
-      if (typeof (part as any).id === "string" && (part as any).id.length > 0) {
-        target.partIds.push((part as any).id)
-      }
-      target.totalChars += getPartCharCount(part)
+      target.texts.push(...entry.texts)
+      target.hasPrimaryText = target.hasPrimaryText || entry.hasRenderableText || entry.texts.length > 0
+      target.partIds.push(...entry.partIds)
+      target.totalChars += entry.totalChars
     }
   }
 
