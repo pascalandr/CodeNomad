@@ -97,7 +97,6 @@ class ServerEvents {
   }
 
   private dispatch(event: WorkspaceEventPayload) {
-    logSse(`event ${event.type}`)
     this.handlers.get("*")?.forEach((handler) => handler(event))
     this.handlers.get(event.type)?.forEach((handler) => handler(event))
   }

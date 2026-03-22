@@ -119,8 +119,6 @@ class SSEManager {
       return
     }
 
-    log.info("Received event", { type: event.type, event })
-
     switch (event.type) {
       case "message.updated":
         this.onMessageUpdate?.(instanceId, event as MessageUpdateEvent)
