@@ -124,6 +124,7 @@ export function buildTimelineSegments(
       pending = null
       return
     }
+    const firstPartId = pending.partIds.find((partId) => partId.length > 0)
     const label = segmentLabel(pending.type)
     const shortLabel = undefined
     const tooltip = formatTextsTooltip(
@@ -132,7 +133,7 @@ export function buildTimelineSegments(
     )
 
     result.push({
-      id: `${record.id}:${segmentIndex}`,
+      id: firstPartId ? `${record.id}:${pending.type}:${firstPartId}` : `${record.id}:${pending.type}:${segmentIndex}`,
       messageId: record.id,
       type: pending.type,
       label,
@@ -167,7 +168,7 @@ export function buildTimelineSegments(
     if (entry.kind === "tool") {
       flushPending()
       result.push({
-        id: `${record.id}:${segmentIndex}`,
+        id: entry.key,
         messageId: record.id,
         type: "tool",
         label: getToolTypeLabel(entry.toolName, t) || segmentLabel("tool"),
@@ -194,7 +195,7 @@ export function buildTimelineSegments(
     if (entry.kind === "compaction") {
       flushPending()
       result.push({
-        id: `${record.id}:${segmentIndex}`,
+        id: entry.key,
         messageId: record.id,
         type: "compaction",
         label: segmentLabel("compaction"),
