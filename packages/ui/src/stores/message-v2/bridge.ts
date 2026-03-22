@@ -148,6 +148,8 @@ function extractPermissionCallId(permission: PermissionRequestLike): string | un
 
 function resolvePartIdFromCallId(store: ReturnType<typeof messageStoreBus.getOrCreate>, messageId?: string, callId?: string): string | undefined {
   if (!messageId || !callId) return undefined
+  const indexed = store.resolveToolCallPartId(messageId, callId)
+  if (indexed) return indexed
   const record = store.getMessage(messageId)
   if (!record) return undefined
   for (const partId of record.partIds) {

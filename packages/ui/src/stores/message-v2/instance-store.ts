@@ -218,6 +218,7 @@ export interface InstanceMessageStore {
   getScrollSnapshot: (sessionId: string, scope: string) => ScrollSnapshot | undefined
   getSessionRevision: (sessionId: string) => number
   getSessionMessageIds: (sessionId: string) => string[]
+  resolveToolCallPartId: (messageId: string, callId?: string) => string | undefined
   // Index of the most recent message in the session that contains a compaction part.
   // Returns -1 if there has been no compaction.
   getLastCompactionMessageIndex: (sessionId: string) => number
@@ -233,8 +234,52 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
   const TODO_TOOL_NAME = "todowrite"
 
   const messageInfoCache = new Map<string, MessageInfo>()
+  const toolCallPartIndex = new Map<string, string>()
   const pendingSessionRevisionBumps = new Set<string>()
   let sessionRevisionFlushQueued = false
+
+  function getToolCallId(part: ClientPart | undefined): string | undefined {
+    if (!part || part.type !== "tool") {
+      return undefined
+    }
+
+    return (
+      (part as any).callID ??
+      (part as any).callId ??
+      (part as any).toolCallID ??
+      (part as any).toolCallId ??
+      undefined
+    )
+  }
+
+  function makeToolCallPartKey(messageId: string, callId: string) {
+    return `${messageId}:${callId}`
+  }
+
+  function clearToolCallPartIndexForMessage(record: MessageRecord | undefined) {
+    if (!record) return
+    for (const partId of record.partIds) {
+      const part = record.parts[partId]?.data
+      const callId = getToolCallId(part)
+      if (!callId) continue
+      toolCallPartIndex.delete(makeToolCallPartKey(record.id, callId))
+    }
+  }
+
+  function indexToolCallPartsForMessage(record: MessageRecord | undefined) {
+    if (!record) return
+    for (const partId of record.partIds) {
+      const part = record.parts[partId]?.data
+      const callId = getToolCallId(part)
+      if (!callId) continue
+      toolCallPartIndex.set(makeToolCallPartKey(record.id, callId), partId)
+    }
+  }
+
+  function resolveToolCallPartId(messageId: string, callId?: string) {
+    if (!messageId || !callId) return undefined
+    return toolCallPartIndex.get(makeToolCallPartKey(messageId, callId))
+  }
 
   function getLastCompactionMessageIndex(sessionId: string): number {
     if (!sessionId) return -1
@@ -447,7 +492,9 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     }
 
     Object.entries(normalizedRecords).forEach(([id, record]) => {
+      clearToolCallPartIndexForMessage(state.messages[id])
       nextMessages[id] = record
+      indexToolCallPartsForMessage(record)
     })
 
     if (infoList) {
@@ -520,6 +567,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     const now = Date.now()
 
     let nextRecord: MessageRecord | undefined
+    const previousRecord = state.messages[input.id]
 
     setState("messages", input.id, (previous) => {
       const revision = previous ? previous.revision + (shouldBump ? 1 : 0) : 0
@@ -540,6 +588,10 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     })
 
     if (nextRecord) {
+      if (normalizedParts) {
+        clearToolCallPartIndexForMessage(previousRecord)
+        indexToolCallPartsForMessage(nextRecord)
+      }
       maybeUpdateLatestTodoFromRecord(nextRecord)
     }
 
@@ -618,6 +670,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
 
     const partId = ensurePartId(input.messageId, input.part, message.partIds.length)
     const cloned = clonePart(input.part)
+    const previousPart = message.parts[partId]?.data as ClientPart | undefined
 
     setState(
       "messages",
@@ -641,6 +694,14 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     )
 
     rebindPermissionForPart(input.messageId, partId, cloned)
+    const previousCallId = getToolCallId(previousPart)
+    if (previousCallId) {
+      toolCallPartIndex.delete(makeToolCallPartKey(input.messageId, previousCallId))
+    }
+    const nextCallId = getToolCallId(cloned)
+    if (nextCallId) {
+      toolCallPartIndex.set(makeToolCallPartKey(input.messageId, nextCallId), partId)
+    }
 
     if (isCompletedTodoPart(cloned)) {
       recordLatestTodoSnapshot(message.sessionId, {
@@ -718,6 +779,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     }
 
     clearRecordDisplayCacheForMessages(instanceId, [messageId])
+    clearToolCallPartIndexForMessage(record)
 
     batch(() => {
       sessionIds.forEach((sessionId) => {
@@ -770,6 +832,11 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     if (!message) return
 
     clearRecordDisplayCacheForMessages(instanceId, [messageId])
+    const part = message.parts[partId]?.data as ClientPart | undefined
+    const callId = getToolCallId(part)
+    if (callId) {
+      toolCallPartIndex.delete(makeToolCallPartKey(messageId, callId))
+    }
 
     batch(() => {
       setState(
@@ -824,6 +891,9 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
       partIds: options.clearParts ? [] : existing.partIds,
       parts: options.clearParts ? {} : existing.parts,
     }
+
+    clearToolCallPartIndexForMessage(existing)
+    indexToolCallPartsForMessage(cloned)
 
     setState("messages", options.newId, cloned)
     setState("messages", (prev) => {
@@ -1022,6 +1092,8 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
     const keptIds = session.messageIds.slice(0, stopIndex)
     if (removedIds.length === 0) return
 
+    removedIds.forEach((id) => clearToolCallPartIndexForMessage(state.messages[id]))
+
     setState("sessions", sessionId, "messageIds", keptIds)
 
     setState("messages", (prev) => {
@@ -1108,6 +1180,7 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
  
     storeLog.info("Clearing session data", { instanceId, sessionId, messageCount: messageIds.length })
     clearRecordDisplayCacheForMessages(instanceId, messageIds)
+    messageIds.forEach((id) => clearToolCallPartIndexForMessage(state.messages[id]))
  
     batch(() => {
       setState("messages", (prev) => {
@@ -1191,10 +1264,11 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
   }
 
  
-   function clearInstance() {
-     messageInfoCache.clear()
-      setState(reconcile(createInitialState(instanceId)))
-    }
+    function clearInstance() {
+      toolCallPartIndex.clear()
+      messageInfoCache.clear()
+       setState(reconcile(createInitialState(instanceId)))
+     }
  
     return {
 
@@ -1226,9 +1300,10 @@ export function createInstanceMessageStore(instanceId: string, hooks?: MessageSt
      getSessionUsage,
      setScrollSnapshot,
      getScrollSnapshot,
-     getSessionRevision: getSessionRevisionValue,
-       getSessionMessageIds: (sessionId: string) => state.sessions[sessionId]?.messageIds ?? [],
-       getLastCompactionMessageIndex,
+       getSessionRevision: getSessionRevisionValue,
+        getSessionMessageIds: (sessionId: string) => state.sessions[sessionId]?.messageIds ?? [],
+        resolveToolCallPartId,
+        getLastCompactionMessageIndex,
        getMessage: (messageId: string) => state.messages[messageId],
        getLatestTodoSnapshot: (sessionId: string) => state.latestTodos[sessionId],
        clearSession,
