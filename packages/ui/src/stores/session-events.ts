@@ -66,6 +66,38 @@ import type { InstanceMessageStore } from "./message-v2/instance-store"
 
 const log = getLogger("sse")
 const pendingSessionFetches = new Map<string, Promise<void>>()
+const pendingSessionInfoUpdates = new Set<string>()
+let sessionInfoFlushQueued = false
+
+function flushPendingSessionInfoUpdates() {
+  sessionInfoFlushQueued = false
+  if (pendingSessionInfoUpdates.size === 0) {
+    return
+  }
+
+  const pending = Array.from(pendingSessionInfoUpdates)
+  pendingSessionInfoUpdates.clear()
+
+  for (const entry of pending) {
+    const [instanceId, sessionId] = entry.split(":")
+    if (!instanceId || !sessionId) continue
+    updateSessionInfo(instanceId, sessionId)
+  }
+}
+
+function scheduleSessionInfoUpdate(instanceId: string, sessionId: string) {
+  if (!instanceId || !sessionId) {
+    return
+  }
+
+  pendingSessionInfoUpdates.add(`${instanceId}:${sessionId}`)
+  if (sessionInfoFlushQueued) {
+    return
+  }
+
+  sessionInfoFlushQueued = true
+  queueMicrotask(flushPendingSessionInfoUpdates)
+}
 
 function shouldSendOsNotification(kind: "needsInput" | "idle"): boolean {
   if (typeof document === "undefined") return false
@@ -338,7 +370,7 @@ function handleMessageUpdate(instanceId: string, event: MessageUpdateEvent | Mes
       reconcilePendingQuestionsV2(instanceId, sessionId)
     }
 
-    updateSessionInfo(instanceId, sessionId)
+    scheduleSessionInfoUpdate(instanceId, sessionId)
   } else if (event.type === "message.updated") {
     const info = event.properties?.info
     if (!info) return
@@ -393,7 +425,7 @@ function handleMessageUpdate(instanceId: string, event: MessageUpdateEvent | Mes
 
     upsertMessageInfoV2(instanceId, info, { status, bumpRevision: true })
 
-    updateSessionInfo(instanceId, sessionId)
+    scheduleSessionInfoUpdate(instanceId, sessionId)
   }
 }
 
@@ -593,7 +625,7 @@ function handleMessageRemoved(instanceId: string, event: MessageRemovedEvent): v
 
   log.info(`[SSE] Message removed from session ${sessionID}`, { messageID })
   removeMessageV2(instanceId, messageID)
-  updateSessionInfo(instanceId, sessionID)
+  scheduleSessionInfoUpdate(instanceId, sessionID)
 }
 
 function handleMessagePartRemoved(instanceId: string, event: MessagePartRemovedEvent): void {
@@ -602,7 +634,7 @@ function handleMessagePartRemoved(instanceId: string, event: MessagePartRemovedE
 
   log.info(`[SSE] Message part removed from session ${sessionID}`, { messageID, partID })
   removeMessagePartV2(instanceId, messageID, partID)
-  updateSessionInfo(instanceId, sessionID)
+  scheduleSessionInfoUpdate(instanceId, sessionID)
 }
 
 function handleTuiToast(_instanceId: string, event: TuiToastEvent): void {
