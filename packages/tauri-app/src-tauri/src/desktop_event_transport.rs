@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Url};
 
 const EVENT_BATCH_NAME: &str = "desktop:event-batch";
 const EVENT_STATUS_NAME: &str = "desktop:event-stream-status";
@@ -554,16 +554,35 @@ fn resolve_session_cookie(app: &AppHandle, config: &DesktopEventStreamConfig) ->
 
 fn read_session_cookie_from_webview(
     app: &AppHandle,
-    _base_url: &str,
+    base_url: &str,
     cookie_name: &str,
 ) -> Option<String> {
+    let url = Url::parse(base_url).ok()?;
+    let host = url.host_str()?.to_ascii_lowercase();
+    let path = url.path();
     let windows = app.webview_windows();
     let window = windows.get("main")?;
     let cookies = window.cookies().ok()?;
     cookies
         .into_iter()
-        .find(|cookie: &tauri::webview::cookie::Cookie<'static>| cookie.name() == cookie_name)
+        .filter(|cookie: &tauri::webview::cookie::Cookie<'static>| cookie.name() == cookie_name)
+        .filter(|cookie: &tauri::webview::cookie::Cookie<'static>| {
+            let Some(domain) = cookie.domain() else {
+                return true;
+            };
+
+            let normalized_domain = domain.trim_start_matches('.').to_ascii_lowercase();
+            host == normalized_domain || host.ends_with(&format!(".{}", normalized_domain))
+        })
+        .filter(|cookie: &tauri::webview::cookie::Cookie<'static>| {
+            let Some(cookie_path) = cookie.path() else {
+                return true;
+            };
+
+            path.starts_with(cookie_path)
+        })
         .map(|cookie: tauri::webview::cookie::Cookie<'static>| cookie.value().to_string())
+        .next()
 }
 
 fn consume_stream(
