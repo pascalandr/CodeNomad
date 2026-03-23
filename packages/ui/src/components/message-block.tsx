@@ -1,4 +1,4 @@
-import { For, Match, Show, Switch, createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
+import { For, Match, Show, Suspense, Switch, createEffect, createMemo, createSignal, lazy, onCleanup, untrack } from "solid-js"
 import { ChevronsDownUp, ChevronsUpDown, ExternalLink, FoldVertical, ListStart, Trash } from "lucide-solid"
 import MessageItem from "./message-item"
 import { isSupportedPartType, projectMessageEntries } from "./message-render-projection"
@@ -29,6 +29,12 @@ const TOOL_ICON = "🔧"
 const USER_BORDER_COLOR = "var(--message-user-border)"
 const ASSISTANT_BORDER_COLOR = "var(--message-assistant-border)"
 const TOOL_BORDER_COLOR = "var(--message-tool-border)"
+
+const LazyToolCall = lazy(() => import("./tool-call"))
+
+function ToolCallFallback() {
+  return <div class="tool-call tool-call-loading" />
+}
 
 type ToolCallPart = Extract<ClientPart, { type: "tool" }>
 
@@ -458,16 +464,18 @@ function ToolCallItem(props: ToolCallItemProps) {
             </div>
           </div>
 
-          <ToolCall
-            toolCall={resolvedToolPart()}
-            toolCallId={props.partId}
-            messageId={props.messageId}
-            messageVersion={messageVersion()}
-            partVersion={partVersion()}
-            instanceId={props.instanceId}
-            sessionId={props.sessionId}
-            onContentRendered={props.onContentRendered}
-          />
+          <Suspense fallback={<ToolCallFallback />}>
+            <LazyToolCall
+              toolCall={resolvedToolPart()}
+              toolCallId={props.partId}
+              messageId={props.messageId}
+              messageVersion={messageVersion()}
+              partVersion={partVersion()}
+              instanceId={props.instanceId}
+              sessionId={props.sessionId}
+              onContentRendered={props.onContentRendered}
+            />
+          </Suspense>
         </div>
       )}
     </Show>
@@ -825,6 +833,7 @@ export default function MessageBlock(props: MessageBlockProps) {
                     onDeleteMessagesUpTo={props.onDeleteMessagesUpTo}
                     selectedMessageIds={props.selectedMessageIds}
                     onToggleSelectedMessage={props.onToggleSelectedMessage}
+                    onContentRendered={props.onContentRendered}
                   />
                 </Match>
               </Switch>
@@ -1203,6 +1212,7 @@ interface ReasoningCardProps {
   onDeleteMessagesUpTo?: (messageId: string) => void | Promise<void>
   selectedMessageIds?: () => Set<string>
   onToggleSelectedMessage?: (messageId: string, selected: boolean) => void
+  onContentRendered?: () => void
 }
 
 function ReasoningCard(props: ReasoningCardProps) {
@@ -1211,6 +1221,25 @@ function ReasoningCard(props: ReasoningCardProps) {
   const [deletingMessage, setDeletingMessage] = createSignal(false)
   const [deletingUpTo, setDeletingUpTo] = createSignal(false)
   const isSelectedForDeletion = () => Boolean(props.selectedMessageIds?.().has(props.messageId))
+  let pendingRenderNotificationFrame: number | null = null
+
+  const notifyContentRendered = () => {
+    if (!props.onContentRendered || typeof requestAnimationFrame !== "function") return
+    if (pendingRenderNotificationFrame !== null) {
+      cancelAnimationFrame(pendingRenderNotificationFrame)
+    }
+    pendingRenderNotificationFrame = requestAnimationFrame(() => {
+      pendingRenderNotificationFrame = null
+      props.onContentRendered?.()
+    })
+  }
+
+  onCleanup(() => {
+    if (pendingRenderNotificationFrame !== null) {
+      cancelAnimationFrame(pendingRenderNotificationFrame)
+      pendingRenderNotificationFrame = null
+    }
+  })
 
   createEffect(() => {
     setExpanded(Boolean(props.defaultExpanded))
@@ -1278,6 +1307,12 @@ function ReasoningCard(props: ReasoningCardProps) {
 
   const viewHideLabel = () =>
     expanded() ? t("messageBlock.reasoning.indicator.hide") : t("messageBlock.reasoning.indicator.view")
+
+  createEffect(() => {
+    if (!expanded()) return
+    reasoningText()
+    notifyContentRendered()
+  })
 
   const canDeleteMessage = () => Boolean(props.showDeleteMessage) && !deletingMessage()
 
