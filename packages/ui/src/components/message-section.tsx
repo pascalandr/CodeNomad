@@ -16,6 +16,7 @@ import { showToastNotification } from "../lib/notifications"
 import { showAlertDialog } from "../stores/alerts"
 import { deleteMessage, deleteMessagePart } from "../stores/session-actions"
 import type { InstanceMessageStore } from "../stores/message-v2/instance-store"
+import type { MessageRecord } from "../stores/message-v2/types"
 import type { DeleteHoverState } from "../types/delete-hover"
 import { buildRecordDisplayData } from "../stores/message-v2/record-display-cache"
 import { getPartCharCount } from "../lib/token-utils"
@@ -332,7 +333,7 @@ export default function MessageSection(props: MessageSectionProps) {
 
   const seenTimelineMessageIds = new Set<string>()
   const seenTimelineSegmentKeys = new Set<string>()
-  const timelineStructureKeysByMessageId = new Map<string, string>()
+  const timelineStateByMessageId = new Map<string, { revision: number; structureKey: string }>()
   let pendingTimelineMessagePartUpdates = new Set<string>()
   let pendingTimelinePartUpdateFrame: number | null = null
 
@@ -340,10 +341,17 @@ export default function MessageSection(props: MessageSectionProps) {
     return `${segment.messageId}:${segment.id}:${segment.type}`
   }
 
+  function buildTimelineMessageState(record: MessageRecord | undefined) {
+    return {
+      revision: record?.revision ?? -1,
+      structureKey: buildMessageProjectionStructureKey(record),
+    }
+  }
+
   function seedTimeline() {
     seenTimelineMessageIds.clear()
     seenTimelineSegmentKeys.clear()
-    timelineStructureKeysByMessageId.clear()
+    timelineStateByMessageId.clear()
     const ids = untrack(messageIds)
     const resolvedStore = untrack(store)
     const segments: TimelineSegment[] = []
@@ -351,7 +359,7 @@ export default function MessageSection(props: MessageSectionProps) {
       const record = resolvedStore.getMessage(messageId)
       if (!record) return
       seenTimelineMessageIds.add(messageId)
-      timelineStructureKeysByMessageId.set(messageId, buildMessageProjectionStructureKey(record))
+      timelineStateByMessageId.set(messageId, buildTimelineMessageState(record))
       const built = buildTimelineSegments(props.instanceId, record, t)
       built.forEach((segment) => {
         const key = makeTimelineKey(segment)
@@ -366,7 +374,7 @@ export default function MessageSection(props: MessageSectionProps) {
   function appendTimelineForMessage(messageId: string) {
     const record = untrack(() => store().getMessage(messageId))
     if (!record) return
-    timelineStructureKeysByMessageId.set(messageId, buildMessageProjectionStructureKey(record))
+    timelineStateByMessageId.set(messageId, buildTimelineMessageState(record))
     const built = buildTimelineSegments(props.instanceId, record, t)
     if (built.length === 0) return
     const newSegments: TimelineSegment[] = []
@@ -741,7 +749,7 @@ export default function MessageSection(props: MessageSectionProps) {
       setTimelineSegments([])
       seenTimelineMessageIds.clear()
       seenTimelineSegmentKeys.clear()
-      timelineStructureKeysByMessageId.clear()
+      timelineStateByMessageId.clear()
       pendingTimelineMessagePartUpdates.clear()
       if (pendingTimelinePartUpdateFrame !== null) {
         cancelAnimationFrame(pendingTimelinePartUpdateFrame)
@@ -790,10 +798,10 @@ export default function MessageSection(props: MessageSectionProps) {
           })
 
           // Keep part count tracking in sync with id replacement.
-          const existingStructureKey = timelineStructureKeysByMessageId.get(oldId)
-          if (existingStructureKey !== undefined) {
-            timelineStructureKeysByMessageId.delete(oldId)
-            timelineStructureKeysByMessageId.set(newId, existingStructureKey)
+          const existingState = timelineStateByMessageId.get(oldId)
+          if (existingState !== undefined) {
+            timelineStateByMessageId.delete(oldId)
+            timelineStateByMessageId.set(newId, existingState)
           }
 
           previousTimelineIds = ids.slice()
@@ -890,25 +898,35 @@ export default function MessageSection(props: MessageSectionProps) {
     let hasChanges = false
     for (const messageId of ids) {
       const record = resolvedStore.getMessage(messageId)
-      const structureKey = buildMessageProjectionStructureKey(record)
-      const previousStructureKey = timelineStructureKeysByMessageId.get(messageId)
-
-      if (previousStructureKey === undefined) {
-        timelineStructureKeysByMessageId.set(messageId, structureKey)
+      const previousState = timelineStateByMessageId.get(messageId)
+      if (!previousState) {
+        timelineStateByMessageId.set(messageId, buildTimelineMessageState(record))
         continue
       }
 
-      if (previousStructureKey !== structureKey) {
-        timelineStructureKeysByMessageId.set(messageId, structureKey)
+      const nextRevision = record?.revision ?? -1
+      if (previousState.revision === nextRevision) {
+        continue
+      }
+
+      // Structural projection is part-walk heavy; skip it unless the message
+      // revision actually changed.
+      const nextStructureKey = buildMessageProjectionStructureKey(record)
+      timelineStateByMessageId.set(messageId, {
+        revision: nextRevision,
+        structureKey: nextStructureKey,
+      })
+
+      if (previousState.structureKey !== nextStructureKey) {
         pendingTimelineMessagePartUpdates.add(messageId)
         hasChanges = true
       }
     }
 
     // Drop tracking for ids that are no longer present.
-    for (const trackedId of Array.from(timelineStructureKeysByMessageId.keys())) {
+    for (const trackedId of Array.from(timelineStateByMessageId.keys())) {
       if (!ids.includes(trackedId)) {
-        timelineStructureKeysByMessageId.delete(trackedId)
+        timelineStateByMessageId.delete(trackedId)
       }
     }
 
