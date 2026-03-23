@@ -580,7 +580,7 @@ export default function MessageSection(props: MessageSectionProps) {
   const [streamElement, setStreamElement] = createSignal<HTMLDivElement | undefined>()
   const [streamShellElement, setStreamShellElement] = createSignal<HTMLDivElement | undefined>()
 
-  const followToken = createMemo(() => `${sessionRevision()}|${preferenceSignature()}`)
+  const followToken = createMemo(() => preferenceSignature())
 
   const initialScrollSnapshot = createMemo(() => store().getScrollSnapshot(props.sessionId, MESSAGE_SCROLL_CACHE_SCOPE))
   const initialAutoScroll = createMemo(() => initialScrollSnapshot()?.atBottom ?? true)
