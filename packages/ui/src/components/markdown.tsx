@@ -92,8 +92,14 @@ export function Markdown(props: MarkdownProps) {
   let containerRef: HTMLDivElement | undefined
   let latestRequestKey = ""
   let cleanupLanguageListener: (() => void) | undefined
+  let lastRenderedNotificationKey = ""
 
-  const notifyRendered = () => {
+  const notifyRendered = (requestKey: string, renderedHtml: string) => {
+    const notificationKey = `${requestKey}:${hashText(renderedHtml)}`
+    if (notificationKey === lastRenderedNotificationKey) {
+      return
+    }
+    lastRenderedNotificationKey = notificationKey
     Promise.resolve().then(() => props.onRendered?.())
   }
 
@@ -130,7 +136,7 @@ export function Markdown(props: MarkdownProps) {
     }
     setHtml(renderedHtml)
     cacheHandle.set(cacheEntry)
-    notifyRendered()
+    notifyRendered(snapshot.requestKey, renderedHtml)
   }
 
   const renderSnapshot = async (snapshot: ReturnType<typeof resolved>) => {
@@ -157,19 +163,20 @@ export function Markdown(props: MarkdownProps) {
     const localCache = snapshot.part.renderCache
     if (localCache && cacheMatches(localCache)) {
       setHtml(localCache.html)
-      notifyRendered()
+      notifyRendered(snapshot.requestKey, localCache.html)
       return
     }
 
     const globalCache = cacheHandle.get<RenderCache>()
     if (globalCache && cacheMatches(globalCache)) {
       setHtml(globalCache.html)
-      notifyRendered()
+      notifyRendered(snapshot.requestKey, globalCache.html)
       return
     }
 
-    setHtml(renderFallbackHtml(snapshot.text))
-    notifyRendered()
+    const fallbackHtml = renderFallbackHtml(snapshot.text)
+    setHtml(fallbackHtml)
+    notifyRendered(snapshot.requestKey, fallbackHtml)
 
     void renderSnapshot(snapshot).catch((error) => {
       log.error("Failed to render markdown:", error)
