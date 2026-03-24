@@ -8,12 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, Url};
 
 const EVENT_BATCH_NAME: &str = "desktop:event-batch";
 const EVENT_STATUS_NAME: &str = "desktop:event-stream-status";
 const FLUSH_INTERVAL_MS: u64 = 16;
+const DELTA_STREAM_WINDOW_MS: u64 = 48;
 const MAX_BATCH_EVENTS: usize = 256;
 const DEFAULT_RECONNECT_INITIAL_DELAY_MS: u64 = 1_000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS: u64 = 10_000;
@@ -155,6 +156,7 @@ enum PendingEntry {
         key: String,
         scope: String,
         event: Value,
+        started_at: Instant,
     },
     Status {
         key: String,
@@ -213,7 +215,12 @@ impl PendingBatch {
                     }
                 }
 
-                self.events.push(PendingEntry::Delta { key, scope, event });
+                self.events.push(PendingEntry::Delta {
+                    key,
+                    scope,
+                    event,
+                    started_at: Instant::now(),
+                });
             }
             EventDeliveryPolicy::CoalesceStatus(key) => {
                 if let Some(PendingEntry::Status {
@@ -285,6 +292,14 @@ impl PendingBatch {
 
     fn pending_len(&self) -> usize {
         self.events.len()
+    }
+
+    fn should_hold_single_delta(&self, now: Instant) -> bool {
+        matches!(
+            self.events.as_slice(),
+            [PendingEntry::Delta { started_at, .. }]
+                if now.duration_since(*started_at) < Duration::from_millis(DELTA_STREAM_WINDOW_MS)
+        )
     }
 }
 
@@ -658,6 +673,9 @@ fn consume_stream(
             }
             Err(RecvTimeoutError::Timeout) => {
                 if !pending.is_empty() {
+                    if pending.should_hold_single_delta(Instant::now()) {
+                        continue;
+                    }
                     sequence += 1;
                     emit_batch(app, generation, &mut pending, sequence, state, stats);
                 }
@@ -821,13 +839,24 @@ fn classify_event(event: &Value) -> EventDeliveryPolicy {
     EventDeliveryPolicy::Passthrough
 }
 
-fn snapshot_key(event: &Value) -> Option<String> {
-    let instance_id = event.get("instanceId")?.as_str()?;
-    if event.get("type")?.as_str()? != "instance.event" {
-        return None;
+fn coalesced_payload_event<'a>(event: &'a Value) -> &'a Value {
+    if event.get("type").and_then(Value::as_str) == Some("instance.event") {
+        event.get("event").unwrap_or(event)
+    } else {
+        event
     }
+}
 
-    let inner = event.get("event")?;
+fn coalesced_instance_id(event: &Value) -> &str {
+    event
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn snapshot_key(event: &Value) -> Option<String> {
+    let instance_id = coalesced_instance_id(event);
+    let inner = coalesced_payload_event(event);
     let inner_type = inner.get("type")?.as_str()?;
     let props = inner.get("properties")?;
 
@@ -883,12 +912,8 @@ fn snapshot_key(event: &Value) -> Option<String> {
 }
 
 fn delta_scope(event: &Value) -> Option<String> {
-    let instance_id = event.get("instanceId")?.as_str()?;
-    if event.get("type")?.as_str()? != "instance.event" {
-        return None;
-    }
-
-    let inner = event.get("event")?;
+    let instance_id = coalesced_instance_id(event);
+    let inner = coalesced_payload_event(event);
     if inner.get("type")?.as_str()? != "message.part.delta" {
         return None;
     }
@@ -916,19 +941,15 @@ fn delta_scope(event: &Value) -> Option<String> {
 
 fn delta_key(event: &Value) -> Option<String> {
     let scope = delta_scope(event)?;
-    let props = event.get("event")?.get("properties")?;
+    let props = coalesced_payload_event(event).get("properties")?;
     let field = props.get("field")?.as_str()?;
 
     Some(format!("{}:{}", scope, field))
 }
 
 fn snapshot_superseded_delta_scope(event: &Value) -> Option<String> {
-    let instance_id = event.get("instanceId")?.as_str()?;
-    if event.get("type")?.as_str()? != "instance.event" {
-        return None;
-    }
-
-    let inner = event.get("event")?;
+    let instance_id = coalesced_instance_id(event);
+    let inner = coalesced_payload_event(event);
     if inner.get("type")?.as_str()? != "message.part.updated" {
         return None;
     }
@@ -951,16 +972,13 @@ fn snapshot_superseded_delta_scope(event: &Value) -> Option<String> {
 }
 
 fn append_delta(target: &mut Value, event: &Value) {
-    let next_delta = event
-        .get("event")
-        .and_then(|value| value.get("properties"))
+    let next_delta = coalesced_payload_event(event)
+        .get("properties")
         .and_then(|value| value.get("delta"))
         .and_then(Value::as_str)
         .unwrap_or_default();
 
-    if let Some(existing_delta) = target
-        .get_mut("event")
-        .and_then(Value::as_object_mut)
+    if let Some(existing_delta) = coalesced_payload_event_mut(target)
         .and_then(|event| event.get_mut("properties"))
         .and_then(Value::as_object_mut)
         .and_then(|props| props.get_mut("delta"))
@@ -970,12 +988,20 @@ fn append_delta(target: &mut Value, event: &Value) {
     }
 }
 
-fn status_key(event: &Value) -> Option<String> {
-    if event.get("type")?.as_str()? != "instance.eventStatus" {
-        return None;
+fn coalesced_payload_event_mut(event: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    if event.get("type").and_then(Value::as_str) == Some("instance.event") {
+        event.get_mut("event").and_then(Value::as_object_mut)
+    } else {
+        event.as_object_mut()
     }
+}
 
-    Some(event.get("instanceId")?.as_str()?.to_string())
+fn status_key(event: &Value) -> Option<String> {
+    match event.get("type")?.as_str()? {
+        "instance.eventStatus" => Some(coalesced_instance_id(event).to_string()),
+        "session.status" => snapshot_key(event),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1016,6 +1042,34 @@ mod tests {
                     "partID": part_id,
                     "field": "text",
                     "delta": delta,
+                }
+            }
+        })
+    }
+
+    fn direct_delta_event(delta: &str) -> Value {
+        json!({
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "sess-1",
+                "messageID": "msg-1",
+                "partID": "part-1",
+                "field": "text",
+                "delta": delta,
+            }
+        })
+    }
+
+    fn direct_message_part_updated_event(text: &str) -> Value {
+        json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "part-1",
+                    "type": "text",
+                    "text": text,
+                    "sessionID": "sess-1",
+                    "messageID": "msg-1"
                 }
             }
         })
@@ -1234,5 +1288,65 @@ mod tests {
         assert_eq!(compute_reconnect_delay_ms(2, &policy), 200);
         assert_eq!(compute_reconnect_delay_ms(3, &policy), 400);
         assert_eq!(compute_reconnect_delay_ms(4, &policy), 500);
+    }
+
+    #[test]
+    fn holds_single_delta_within_stream_window() {
+        let pending = PendingBatch {
+            events: vec![PendingEntry::Delta {
+                key: "delta-key".to_string(),
+                scope: "delta-scope".to_string(),
+                event: delta_event("Hello"),
+                started_at: Instant::now(),
+            }],
+        };
+
+        assert!(pending.should_hold_single_delta(Instant::now()));
+    }
+
+    #[test]
+    fn flushes_single_delta_after_stream_window() {
+        let started_at = Instant::now() - Duration::from_millis(DELTA_STREAM_WINDOW_MS + 1);
+        let pending = PendingBatch {
+            events: vec![PendingEntry::Delta {
+                key: "delta-key".to_string(),
+                scope: "delta-scope".to_string(),
+                event: delta_event("Hello"),
+                started_at,
+            }],
+        };
+
+        assert!(!pending.should_hold_single_delta(Instant::now()));
+    }
+
+    #[test]
+    fn coalesces_direct_message_part_delta_events() {
+        let mut pending = PendingBatch::default();
+        let mut stats = fresh_stats();
+        pending.push(direct_delta_event("Hello"), &mut stats);
+        pending.push(direct_delta_event(" world"), &mut stats);
+
+        let events = pending.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["properties"]["delta"].as_str(),
+            Some("Hello world")
+        );
+    }
+
+    #[test]
+    fn direct_snapshot_replaces_trailing_direct_deltas_for_same_part() {
+        let mut pending = PendingBatch::default();
+        let mut stats = fresh_stats();
+        pending.push(direct_delta_event("Hello"), &mut stats);
+        pending.push(direct_message_part_updated_event("Hello world"), &mut stats);
+
+        let events = pending.take_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"].as_str(), Some("message.part.updated"));
+        assert_eq!(
+            events[0]["properties"]["part"]["text"].as_str(),
+            Some("Hello world")
+        );
     }
 }
