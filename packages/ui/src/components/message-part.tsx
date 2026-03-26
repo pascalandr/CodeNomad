@@ -1,8 +1,9 @@
-import { Match, Show, Suspense, Switch, lazy } from "solid-js"
+import { Match, Show, Suspense, Switch, createEffect, lazy } from "solid-js"
 import { isItemExpanded, toggleItemExpanded } from "../stores/tool-call-state"
 import { Markdown } from "./markdown"
 import { useTheme } from "../lib/theme"
 import { partHasRenderableText, SDKPart, TextPart, ClientPart } from "../types/message"
+import type { MessageStatus } from "../stores/message-v2/types"
 
 type ToolCallPart = Extract<ClientPart, { type: "tool" }>
 
@@ -11,6 +12,7 @@ const LazyToolCall = lazy(() => import("./tool-call"))
 interface MessagePartProps {
   part: ClientPart
   messageType?: "user" | "assistant"
+  messageStatus?: MessageStatus
   instanceId: string
   sessionId: string
   // For user messages, keep the primary prompt text visible even when synthetic (optimistic).
@@ -22,6 +24,7 @@ interface MessagePartProps {
 export default function MessagePart(props: MessagePartProps) {
 
   const { isDark } = useTheme()
+  let lastStreamingRenderKey = ""
   const partType = () => props.part?.type || ""
   const reasoningId = () => `reasoning-${props.part?.id || ""}`
   const isReasoningExpanded = () => isItemExpanded(reasoningId())
@@ -29,6 +32,7 @@ export default function MessagePart(props: MessagePartProps) {
   const textContainerClass = () => (isAssistantMessage() ? "message-text message-text-assistant" : "message-text")
   const markdownContainerClass = () => "message-text message-text-assistant"
   const textContainerRole = () => props.messageType || "assistant"
+  const isAssistantStreaming = () => isAssistantMessage() && props.messageStatus === "streaming"
 
   const shouldHideTextPart = () => {
     const part = props.part
@@ -63,6 +67,29 @@ export default function MessagePart(props: MessagePartProps) {
     const id = (props.part as unknown as { id?: unknown })?.id
     return typeof id === "string" && id.length > 0
   }
+
+  const shouldUsePlainStreamingText = () => {
+    if (!isAssistantStreaming()) return false
+    const part = props.part
+    return part?.type === "text" && typeof part.text === "string" && part.text.length > 0
+  }
+
+  createEffect(() => {
+    if (!shouldUsePlainStreamingText()) {
+      lastStreamingRenderKey = ""
+      return
+    }
+
+    const partId = typeof (props.part as any)?.id === "string" ? (props.part as any).id : ""
+    const text = plainTextContent()
+    const renderKey = `${partId}:${text.length}:${text.slice(-64)}`
+    if (renderKey === lastStreamingRenderKey) {
+      return
+    }
+
+    lastStreamingRenderKey = renderKey
+    Promise.resolve().then(() => props.onRendered?.())
+  })
 
   function reasoningSegmentHasText(segment: unknown): boolean {
     if (typeof segment === "string") {
@@ -139,13 +166,17 @@ export default function MessagePart(props: MessagePartProps) {
             data-part-type="text"
             data-part-id={typeof (props.part as any)?.id === "string" ? (props.part as any).id : undefined}
           >
-            <Show when={canRenderMarkdown()} fallback={<span class="text-primary" dir="auto">{plainTextContent()}</span>}>
+            <Show
+              when={!shouldUsePlainStreamingText() && canRenderMarkdown()}
+              fallback={<div class="message-streaming-plain-text" dir="auto">{plainTextContent()}</div>}
+            >
               <Markdown
                 part={createTextPartForMarkdown()}
                 instanceId={props.instanceId}
                 sessionId={props.sessionId}
                 isDark={isDark()}
                 size={isAssistantMessage() ? "tight" : "base"}
+                deferRichRender={isAssistantMessage()}
                 onRendered={props.onRendered}
               />
             </Show>

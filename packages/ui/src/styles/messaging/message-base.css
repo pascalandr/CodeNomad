@@ -253,6 +253,15 @@
   white-space: normal;
 }
 
+.message-streaming-plain-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+}
+
 .message-text pre {
   overflow-x: auto;
   padding: 8px;

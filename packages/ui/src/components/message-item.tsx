@@ -566,6 +566,7 @@ export default function MessageItem(props: MessageItemProps) {
                 <MessagePart
                   part={part}
                   messageType={props.record.role}
+                  messageStatus={props.record.status}
                   instanceId={props.instanceId}
                   sessionId={props.sessionId}
                   primaryUserTextPartId={primaryUserTextPartId()}

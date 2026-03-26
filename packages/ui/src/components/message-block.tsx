@@ -494,6 +494,7 @@ type ReasoningDisplayItem = {
   type: "reasoning"
   key: string
   part: ClientPart
+  text: string
   messageInfo?: MessageInfo
   showAgentMeta?: boolean
   defaultExpanded: boolean
@@ -683,6 +684,7 @@ export default function MessageBlock(props: MessageBlockProps) {
           type: "reasoning",
           key: entry.key,
           part: entry.part,
+          text: entry.text,
           messageInfo: info,
           showAgentMeta,
           defaultExpanded: props.thinkingDefaultExpanded(),
@@ -822,6 +824,7 @@ export default function MessageBlock(props: MessageBlockProps) {
                 <Match when={item.type === "reasoning"}>
                   <ReasoningCard
                     part={(item as ReasoningDisplayItem).part}
+                    text={(item as ReasoningDisplayItem).text}
                     messageInfo={(item as ReasoningDisplayItem).messageInfo}
                     instanceId={props.instanceId}
                     sessionId={props.sessionId}
@@ -1201,6 +1204,7 @@ function formatCostValue(value: number) {
 
 interface ReasoningCardProps {
   part: ClientPart
+  text?: string
   messageInfo?: MessageInfo
   instanceId: string
   sessionId: string
@@ -1213,6 +1217,41 @@ interface ReasoningCardProps {
   selectedMessageIds?: () => Set<string>
   onToggleSelectedMessage?: (messageId: string, selected: boolean) => void
   onContentRendered?: () => void
+}
+
+function flattenReasoningText(part: ClientPart | undefined): string {
+  const reasoningPart = part as any
+  if (!reasoningPart) return ""
+
+  const stringifySegment = (segment: unknown): string => {
+    if (typeof segment === "string") {
+      return segment
+    }
+    if (segment && typeof segment === "object") {
+      const obj = segment as { text?: unknown; value?: unknown; content?: unknown[] }
+      const pieces: string[] = []
+      if (typeof obj.text === "string") {
+        pieces.push(obj.text)
+      }
+      if (typeof obj.value === "string") {
+        pieces.push(obj.value)
+      }
+      if (Array.isArray(obj.content)) {
+        pieces.push(obj.content.map((entry) => stringifySegment(entry)).join("\n"))
+      }
+      return pieces.filter((piece) => piece && piece.trim().length > 0).join("\n")
+    }
+    return ""
+  }
+
+  const textValue = stringifySegment(reasoningPart.text)
+  if (textValue.trim().length > 0) {
+    return textValue
+  }
+  if (Array.isArray(reasoningPart.content)) {
+    return reasoningPart.content.map((entry: unknown) => stringifySegment(entry)).join("\n")
+  }
+  return ""
 }
 
 function ReasoningCard(props: ReasoningCardProps) {
@@ -1268,40 +1307,7 @@ function ReasoningCard(props: ReasoningCardProps) {
 
   const hasMeta = () => Boolean(props.showAgentMeta && (agentIdentifier() || modelIdentifier()))
 
-  const reasoningText = () => {
-    const part = props.part as any
-    if (!part) return ""
-
-    const stringifySegment = (segment: unknown): string => {
-      if (typeof segment === "string") {
-        return segment
-      }
-      if (segment && typeof segment === "object") {
-        const obj = segment as { text?: unknown; value?: unknown; content?: unknown[] }
-        const pieces: string[] = []
-        if (typeof obj.text === "string") {
-          pieces.push(obj.text)
-        }
-        if (typeof obj.value === "string") {
-          pieces.push(obj.value)
-        }
-        if (Array.isArray(obj.content)) {
-          pieces.push(obj.content.map((entry) => stringifySegment(entry)).join("\n"))
-        }
-        return pieces.filter((piece) => piece && piece.trim().length > 0).join("\n")
-      }
-      return ""
-    }
-
-    const textValue = stringifySegment(part.text)
-    if (textValue.trim().length > 0) {
-      return textValue
-    }
-    if (Array.isArray(part.content)) {
-      return part.content.map((entry: unknown) => stringifySegment(entry)).join("\n")
-    }
-    return ""
-  }
+  const reasoningText = createMemo(() => props.text ?? flattenReasoningText(props.part))
 
   const toggle = () => setExpanded((prev) => !prev)
 
