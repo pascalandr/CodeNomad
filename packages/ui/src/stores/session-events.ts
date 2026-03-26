@@ -45,6 +45,12 @@ import { ensureSessionParentExpanded, sessions, setSessions, syncInstanceSession
 import { normalizeMessagePart } from "./message-v2/normalizers"
 import { updateSessionInfo } from "./message-v2/session-info"
 import { tGlobal } from "../lib/i18n"
+import {
+  appendAssistantStreamChunk,
+  clearAssistantStreamMessage,
+  clearAssistantStreamPart,
+} from "./assistant-stream"
+import type { AssistantStreamChunkEvent } from "../lib/event-transport-contract"
 
 import { loadMessages } from "./session-api"
 import { getOrCreateWorktreeClient, getRootClient, getWorktreeSlugForDirectory, getWorktreeSlugForSession } from "./worktrees"
@@ -322,6 +328,7 @@ function handleMessageUpdate(instanceId: string, event: MessageUpdateEvent | Mes
     const sessionId = typeof part.sessionID === "string" ? part.sessionID : fallbackSessionId
     const messageId = typeof part.messageID === "string" ? part.messageID : fallbackMessageId
     if (!sessionId || !messageId) return
+    clearAssistantStreamPart(instanceId, sessionId, messageId, part.id)
     if (part.type === "compaction") {
       ensureSessionStatus(instanceId, sessionId, "compacting", (event as any)?.directory)
     }
@@ -373,6 +380,7 @@ function handleMessageUpdate(instanceId: string, event: MessageUpdateEvent | Mes
     const sessionId = typeof info.sessionID === "string" ? info.sessionID : undefined
     const messageId = typeof info.id === "string" ? info.id : undefined
     if (!sessionId || !messageId) return
+    clearAssistantStreamMessage(instanceId, sessionId, messageId)
 
     const timeInfo = (info.time ?? {}) as { created?: number; updated?: number; end?: number }
     const nextUpdated =
@@ -432,6 +440,10 @@ function handleMessagePartDelta(instanceId: string, event: MessagePartDeltaEvent
   const { messageID, partID, field, delta } = props
   if (!messageID || !partID || !field || typeof delta !== "string") return
   applyPartDeltaV2(instanceId, { messageId: messageID, partId: partID, field, delta })
+}
+
+function handleAssistantStreamChunk(instanceId: string, event: AssistantStreamChunkEvent): void {
+  appendAssistantStreamChunk(instanceId, event)
 }
 
 function handleSessionUpdate(instanceId: string, event: EventSessionUpdated): void {
@@ -621,6 +633,7 @@ function handleMessageRemoved(instanceId: string, event: MessageRemovedEvent): v
   if (!sessionID || !messageID) return
 
   log.info(`[SSE] Message removed from session ${sessionID}`, { messageID })
+  clearAssistantStreamMessage(instanceId, sessionID, messageID)
   removeMessageV2(instanceId, messageID)
   scheduleSessionInfoUpdate(instanceId, sessionID)
 }
@@ -630,6 +643,7 @@ function handleMessagePartRemoved(instanceId: string, event: MessagePartRemovedE
   if (!sessionID || !messageID || !partID) return
 
   log.info(`[SSE] Message part removed from session ${sessionID}`, { messageID, partID })
+  clearAssistantStreamPart(instanceId, sessionID, messageID, partID)
   removeMessagePartV2(instanceId, messageID, partID)
   scheduleSessionInfoUpdate(instanceId, sessionID)
 }
@@ -711,6 +725,7 @@ function handleQuestionAnswered(
 }
 
 export {
+  handleAssistantStreamChunk,
   handleMessagePartRemoved,
   handleMessageRemoved,
   handleMessagePartDelta,

@@ -565,6 +565,7 @@ export default function MessageItem(props: MessageItemProps) {
               <div class="message-part-shell">
                 <MessagePart
                   part={part}
+                  messageId={props.record.id}
                   messageType={props.record.role}
                   messageStatus={props.record.status}
                   instanceId={props.instanceId}

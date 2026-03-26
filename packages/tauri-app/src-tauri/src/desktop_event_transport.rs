@@ -3,6 +3,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -15,6 +16,10 @@ const EVENT_BATCH_NAME: &str = "desktop:event-batch";
 const EVENT_STATUS_NAME: &str = "desktop:event-stream-status";
 const FLUSH_INTERVAL_MS: u64 = 16;
 const DELTA_STREAM_WINDOW_MS: u64 = 48;
+const ACTIVE_STREAM_DISPLAY_WINDOW_MS: u64 = 32;
+const ACTIVE_STREAM_STORE_WINDOW_MS: u64 = 180;
+const ACTIVE_STREAM_DISPLAY_CHUNK_MAX: usize = 192;
+const ACTIVE_STREAM_STORE_CHUNK_MAX: usize = 1536;
 const MAX_BATCH_EVENTS: usize = 256;
 const DEFAULT_RECONNECT_INITIAL_DELAY_MS: u64 = 1_000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS: u64 = 10_000;
@@ -140,6 +145,13 @@ struct DesktopEventTransportState {
     generation: u64,
     stop: Option<Arc<AtomicBool>>,
     config: Option<DesktopEventTransportConfig>,
+    active_target: Option<ActiveSessionTarget>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ActiveSessionTarget {
+    pub instance_id: String,
+    pub session_id: String,
 }
 
 pub struct DesktopEventTransportManager {
@@ -155,6 +167,8 @@ enum PendingEntry {
     Delta {
         key: String,
         scope: String,
+        instance_id: String,
+        session_id: Option<String>,
         event: Value,
         started_at: Instant,
     },
@@ -193,6 +207,46 @@ struct PendingBatch {
     events: Vec<PendingEntry>,
 }
 
+#[derive(Clone)]
+struct ActiveTextDelta {
+    instance_id: String,
+    session_id: String,
+    message_id: String,
+    part_id: String,
+    delta: String,
+}
+
+struct ActiveTextPartBuffer {
+    instance_id: String,
+    session_id: String,
+    message_id: String,
+    part_id: String,
+    display_pending: String,
+    store_pending: String,
+    last_display_emit: Instant,
+    last_store_emit: Instant,
+}
+
+impl ActiveTextPartBuffer {
+    fn new(delta: ActiveTextDelta, now: Instant) -> Self {
+        Self {
+            instance_id: delta.instance_id,
+            session_id: delta.session_id,
+            message_id: delta.message_id,
+            part_id: delta.part_id,
+            display_pending: delta.delta.clone(),
+            store_pending: delta.delta,
+            last_display_emit: now,
+            last_store_emit: now,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ActiveTextAssembler {
+    parts: HashMap<String, ActiveTextPartBuffer>,
+}
+
 impl PendingBatch {
     fn push(&mut self, event: Value, stats: &mut DesktopEventTransportStats) {
         match classify_event(&event) {
@@ -218,6 +272,8 @@ impl PendingBatch {
                 self.events.push(PendingEntry::Delta {
                     key,
                     scope,
+                    instance_id: coalesced_instance_id(&event).to_string(),
+                    session_id: event_session_id(&event).map(|value| value.to_string()),
                     event,
                     started_at: Instant::now(),
                 });
@@ -294,12 +350,238 @@ impl PendingBatch {
         self.events.len()
     }
 
-    fn should_hold_single_delta(&self, now: Instant) -> bool {
+    fn should_hold_single_delta(
+        &self,
+        now: Instant,
+        active_target: Option<&ActiveSessionTarget>,
+    ) -> bool {
         matches!(
             self.events.as_slice(),
-            [PendingEntry::Delta { started_at, .. }]
-                if now.duration_since(*started_at) < Duration::from_millis(DELTA_STREAM_WINDOW_MS)
+            [PendingEntry::Delta { started_at, instance_id, session_id, .. }]
+                if now.duration_since(*started_at) < Duration::from_millis(
+                    if active_target
+                        .map(|target| {
+                            target.instance_id.as_str() == instance_id.as_str()
+                                && target.session_id.as_str() == session_id.as_deref().unwrap_or_default()
+                        })
+                        .unwrap_or(false)
+                    {
+                        120
+                    } else {
+                        DELTA_STREAM_WINDOW_MS
+                    }
+                )
         )
+    }
+}
+
+impl ActiveTextAssembler {
+    fn absorb(&mut self, delta: ActiveTextDelta, now: Instant) -> Vec<Value> {
+        let key = format!(
+            "{}:{}:{}:{}",
+            delta.instance_id, delta.session_id, delta.message_id, delta.part_id
+        );
+
+        match self.parts.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                let entry = occupied.get_mut();
+                if entry.display_pending.is_empty() && entry.store_pending.is_empty() {
+                    entry.instance_id = delta.instance_id.clone();
+                    entry.session_id = delta.session_id.clone();
+                    entry.message_id = delta.message_id.clone();
+                    entry.part_id = delta.part_id.clone();
+                }
+
+                entry.display_pending.push_str(&delta.delta);
+                entry.store_pending.push_str(&delta.delta);
+                Self::collect_due_for_part(entry, now)
+            }
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let mut entry = ActiveTextPartBuffer::new(delta, now);
+                let emitted = Self::collect_due_for_part(&mut entry, now);
+                vacant.insert(entry);
+                emitted
+            }
+        }
+    }
+
+    fn take_due(&mut self, now: Instant) -> Vec<Value> {
+        let mut emitted = Vec::new();
+        let mut empty_keys = Vec::new();
+
+        for (key, entry) in self.parts.iter_mut() {
+            emitted.extend(Self::collect_due_for_part(entry, now));
+            if entry.display_pending.is_empty() && entry.store_pending.is_empty() {
+                empty_keys.push(key.clone());
+            }
+        }
+
+        for key in empty_keys {
+            self.parts.remove(&key);
+        }
+
+        emitted
+    }
+
+    fn flush_for_event(&mut self, event: &Value, now: Instant) -> Vec<Value> {
+        let instance_id = coalesced_instance_id(event);
+        let payload = coalesced_payload_event(event);
+        let event_type = payload.get("type").and_then(Value::as_str);
+
+        match event_type {
+            Some("message.updated") | Some("message.removed") => {
+                let props = payload.get("properties");
+                let session_id = event_session_id(event);
+                let message_id = props
+                    .and_then(|value| {
+                        value
+                            .get("info")
+                            .and_then(|info| info.get("id"))
+                            .or_else(|| value.get("messageID"))
+                            .or_else(|| value.get("messageId"))
+                    })
+                    .and_then(Value::as_str);
+                if let (Some(session_id), Some(message_id)) = (session_id, message_id) {
+                    return self.flush_message(instance_id, session_id, message_id, now);
+                }
+            }
+            Some("message.part.updated") | Some("message.part.removed") => {
+                let props = payload.get("properties");
+                let session_id = event_session_id(event);
+                let message_id = props
+                    .and_then(|value| {
+                        value
+                            .get("part")
+                            .and_then(|part| {
+                                part.get("messageID").or_else(|| part.get("messageId"))
+                            })
+                            .or_else(|| value.get("messageID"))
+                            .or_else(|| value.get("messageId"))
+                    })
+                    .and_then(Value::as_str);
+                let part_id = props
+                    .and_then(|value| {
+                        value
+                            .get("part")
+                            .and_then(|part| part.get("id"))
+                            .or_else(|| value.get("partID"))
+                            .or_else(|| value.get("partId"))
+                    })
+                    .and_then(Value::as_str);
+                if let (Some(session_id), Some(message_id), Some(part_id)) =
+                    (session_id, message_id, part_id)
+                {
+                    return self.flush_part(instance_id, session_id, message_id, part_id, now);
+                }
+            }
+            _ => {}
+        }
+
+        Vec::new()
+    }
+
+    fn flush_message(
+        &mut self,
+        instance_id: &str,
+        session_id: &str,
+        message_id: &str,
+        now: Instant,
+    ) -> Vec<Value> {
+        let keys: Vec<String> = self
+            .parts
+            .iter()
+            .filter(|(_, entry)| {
+                entry.instance_id == instance_id
+                    && entry.session_id == session_id
+                    && entry.message_id == message_id
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+
+        let mut emitted = Vec::new();
+        for key in keys {
+            if let Some(mut entry) = self.parts.remove(&key) {
+                emitted.extend(Self::flush_all_for_part(&mut entry, now));
+            }
+        }
+        emitted
+    }
+
+    fn flush_part(
+        &mut self,
+        instance_id: &str,
+        session_id: &str,
+        message_id: &str,
+        part_id: &str,
+        now: Instant,
+    ) -> Vec<Value> {
+        let key = format!("{}:{}:{}:{}", instance_id, session_id, message_id, part_id);
+        if let Some(mut entry) = self.parts.remove(&key) {
+            return Self::flush_all_for_part(&mut entry, now);
+        }
+        Vec::new()
+    }
+
+    fn flush_store_only_all(&mut self, now: Instant) -> Vec<Value> {
+        let mut emitted = Vec::new();
+        for entry in self.parts.values_mut() {
+            if !entry.store_pending.is_empty() {
+                emitted.push(make_message_part_delta_event(entry, &entry.store_pending));
+                entry.store_pending.clear();
+                entry.last_store_emit = now;
+            }
+            entry.display_pending.clear();
+            entry.last_display_emit = now;
+        }
+        self.parts.clear();
+        emitted
+    }
+
+    fn collect_due_for_part(entry: &mut ActiveTextPartBuffer, now: Instant) -> Vec<Value> {
+        let mut emitted = Vec::new();
+
+        if !entry.display_pending.is_empty()
+            && (now.duration_since(entry.last_display_emit)
+                >= Duration::from_millis(ACTIVE_STREAM_DISPLAY_WINDOW_MS)
+                || entry.display_pending.chars().count() >= ACTIVE_STREAM_DISPLAY_CHUNK_MAX)
+        {
+            emitted.push(make_assistant_stream_chunk_event(
+                entry,
+                &entry.display_pending,
+            ));
+            entry.display_pending.clear();
+            entry.last_display_emit = now;
+        }
+
+        if !entry.store_pending.is_empty()
+            && (now.duration_since(entry.last_store_emit)
+                >= Duration::from_millis(ACTIVE_STREAM_STORE_WINDOW_MS)
+                || entry.store_pending.chars().count() >= ACTIVE_STREAM_STORE_CHUNK_MAX)
+        {
+            emitted.push(make_message_part_delta_event(entry, &entry.store_pending));
+            entry.store_pending.clear();
+            entry.last_store_emit = now;
+        }
+
+        emitted
+    }
+
+    fn flush_all_for_part(entry: &mut ActiveTextPartBuffer, now: Instant) -> Vec<Value> {
+        let mut emitted = Vec::new();
+        if !entry.display_pending.is_empty() {
+            emitted.push(make_assistant_stream_chunk_event(
+                entry,
+                &entry.display_pending,
+            ));
+            entry.display_pending.clear();
+            entry.last_display_emit = now;
+        }
+        if !entry.store_pending.is_empty() {
+            emitted.push(make_message_part_delta_event(entry, &entry.store_pending));
+            entry.store_pending.clear();
+            entry.last_store_emit = now;
+        }
+        emitted
     }
 }
 
@@ -310,8 +592,14 @@ impl DesktopEventTransportManager {
                 generation: 0,
                 stop: None,
                 config: None,
+                active_target: None,
             })),
         }
+    }
+
+    pub fn set_active_session_target(&self, target: Option<ActiveSessionTarget>) {
+        let mut state = self.state.lock();
+        state.active_target = target;
     }
 
     pub fn start(
@@ -373,6 +661,7 @@ impl DesktopEventTransportManager {
             stop.store(true, Ordering::SeqCst);
         }
         state.config = None;
+        state.active_target = None;
         state.generation += 1;
     }
 }
@@ -648,7 +937,9 @@ fn consume_stream(
     thread::spawn(move || read_sse(response, tx, reader_stop, reader_state, generation));
 
     let mut pending = PendingBatch::default();
+    let mut active_text_assembler = ActiveTextAssembler::default();
     let mut sequence = 0_u64;
+    let mut last_active_target: Option<ActiveSessionTarget> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) || !generation_matches(state, generation) {
@@ -658,6 +949,36 @@ fn consume_stream(
         match rx.recv_timeout(Duration::from_millis(FLUSH_INTERVAL_MS)) {
             Ok(ReaderMessage::Event(event)) => {
                 stats.raw_events = stats.raw_events.saturating_add(1);
+
+                let now = Instant::now();
+                let active_target = state.lock().active_target.clone();
+                if active_target != last_active_target {
+                    for flushed in active_text_assembler.flush_store_only_all(now) {
+                        pending.push(flushed, stats);
+                    }
+                    last_active_target = active_target.clone();
+                }
+
+                for flushed in active_text_assembler.take_due(now) {
+                    pending.push(flushed, stats);
+                }
+
+                for flushed in active_text_assembler.flush_for_event(&event, now) {
+                    pending.push(flushed, stats);
+                }
+
+                if let Some(delta) = parse_active_text_delta(&event, active_target.as_ref()) {
+                    for assembled in active_text_assembler.absorb(delta, now) {
+                        pending.push(assembled, stats);
+                    }
+
+                    if pending.pending_len() >= MAX_BATCH_EVENTS {
+                        sequence += 1;
+                        emit_batch(app, generation, &mut pending, sequence, state, stats);
+                    }
+                    continue;
+                }
+
                 pending.push(event, stats);
                 if pending.pending_len() >= MAX_BATCH_EVENTS {
                     sequence += 1;
@@ -665,6 +986,9 @@ fn consume_stream(
                 }
             }
             Ok(ReaderMessage::End(reason)) => {
+                for flushed in active_text_assembler.take_due(Instant::now()) {
+                    pending.push(flushed, stats);
+                }
                 if !pending.is_empty() {
                     sequence += 1;
                     emit_batch(app, generation, &mut pending, sequence, state, stats);
@@ -672,8 +996,14 @@ fn consume_stream(
                 return reason;
             }
             Err(RecvTimeoutError::Timeout) => {
+                for flushed in active_text_assembler.take_due(Instant::now()) {
+                    pending.push(flushed, stats);
+                }
                 if !pending.is_empty() {
-                    if pending.should_hold_single_delta(Instant::now()) {
+                    if pending.should_hold_single_delta(
+                        Instant::now(),
+                        state.lock().active_target.as_ref(),
+                    ) {
                         continue;
                     }
                     sequence += 1;
@@ -681,6 +1011,9 @@ fn consume_stream(
                 }
             }
             Err(RecvTimeoutError::Disconnected) => {
+                for flushed in active_text_assembler.take_due(Instant::now()) {
+                    pending.push(flushed, stats);
+                }
                 if !pending.is_empty() {
                     sequence += 1;
                     emit_batch(app, generation, &mut pending, sequence, state, stats);
@@ -852,6 +1185,123 @@ fn coalesced_instance_id(event: &Value) -> &str {
         .get("instanceId")
         .and_then(Value::as_str)
         .unwrap_or_default()
+}
+
+fn event_session_id(event: &Value) -> Option<&str> {
+    let inner = coalesced_payload_event(event);
+    let inner_type = inner.get("type")?.as_str()?;
+    let props = inner.get("properties")?;
+
+    match inner_type {
+        "session.updated" => props
+            .get("info")
+            .and_then(|info| info.get("id"))
+            .and_then(Value::as_str)
+            .or_else(|| {
+                props
+                    .get("sessionID")
+                    .or_else(|| props.get("sessionId"))
+                    .and_then(Value::as_str)
+            }),
+        "message.updated" => props
+            .get("info")
+            .and_then(|info| info.get("sessionID").or_else(|| info.get("sessionId")))
+            .and_then(Value::as_str),
+        "message.part.updated" => props
+            .get("part")
+            .and_then(|part| part.get("sessionID").or_else(|| part.get("sessionId")))
+            .and_then(Value::as_str),
+        "message.part.delta"
+        | "message.removed"
+        | "message.part.removed"
+        | "session.compacted"
+        | "session.diff"
+        | "session.idle"
+        | "session.status" => props
+            .get("sessionID")
+            .or_else(|| props.get("sessionId"))
+            .and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn parse_active_text_delta(
+    event: &Value,
+    active_target: Option<&ActiveSessionTarget>,
+) -> Option<ActiveTextDelta> {
+    let active_target = active_target?;
+    let instance_id = coalesced_instance_id(event);
+    if instance_id != active_target.instance_id {
+        return None;
+    }
+    let inner = coalesced_payload_event(event);
+    if inner.get("type")?.as_str()? != "message.part.delta" {
+        return None;
+    }
+
+    let props = inner.get("properties")?;
+    let field = props.get("field")?.as_str()?;
+    if field != "text" {
+        return None;
+    }
+
+    let event_session = props
+        .get("sessionID")
+        .or_else(|| props.get("sessionId"))
+        .and_then(Value::as_str)?;
+    if event_session != active_target.session_id {
+        return None;
+    }
+
+    Some(ActiveTextDelta {
+        instance_id: instance_id.to_string(),
+        session_id: event_session.to_string(),
+        message_id: props
+            .get("messageID")
+            .or_else(|| props.get("messageId"))
+            .and_then(Value::as_str)?
+            .to_string(),
+        part_id: props
+            .get("partID")
+            .or_else(|| props.get("partId"))
+            .and_then(Value::as_str)?
+            .to_string(),
+        delta: props.get("delta")?.as_str()?.to_string(),
+    })
+}
+
+fn make_assistant_stream_chunk_event(entry: &ActiveTextPartBuffer, delta: &str) -> Value {
+    serde_json::json!({
+        "type": "instance.event",
+        "instanceId": entry.instance_id,
+        "event": {
+            "type": "assistant.stream.chunk",
+            "properties": {
+                "sessionID": entry.session_id,
+                "messageID": entry.message_id,
+                "partID": entry.part_id,
+                "field": "text",
+                "delta": delta,
+            }
+        }
+    })
+}
+
+fn make_message_part_delta_event(entry: &ActiveTextPartBuffer, delta: &str) -> Value {
+    serde_json::json!({
+        "type": "instance.event",
+        "instanceId": entry.instance_id,
+        "event": {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": entry.session_id,
+                "messageID": entry.message_id,
+                "partID": entry.part_id,
+                "field": "text",
+                "delta": delta,
+            }
+        }
+    })
 }
 
 fn snapshot_key(event: &Value) -> Option<String> {
@@ -1296,12 +1746,14 @@ mod tests {
             events: vec![PendingEntry::Delta {
                 key: "delta-key".to_string(),
                 scope: "delta-scope".to_string(),
+                instance_id: "inst-1".to_string(),
+                session_id: Some("sess-1".to_string()),
                 event: delta_event("Hello"),
                 started_at: Instant::now(),
             }],
         };
 
-        assert!(pending.should_hold_single_delta(Instant::now()));
+        assert!(pending.should_hold_single_delta(Instant::now(), None));
     }
 
     #[test]
@@ -1311,12 +1763,110 @@ mod tests {
             events: vec![PendingEntry::Delta {
                 key: "delta-key".to_string(),
                 scope: "delta-scope".to_string(),
+                instance_id: "inst-1".to_string(),
+                session_id: Some("sess-1".to_string()),
                 event: delta_event("Hello"),
                 started_at,
             }],
         };
 
-        assert!(!pending.should_hold_single_delta(Instant::now()));
+        assert!(!pending.should_hold_single_delta(Instant::now(), None));
+    }
+
+    #[test]
+    fn active_session_holds_single_delta_longer() {
+        let started_at = Instant::now() - Duration::from_millis(DELTA_STREAM_WINDOW_MS + 10);
+        let pending = PendingBatch {
+            events: vec![PendingEntry::Delta {
+                key: "delta-key".to_string(),
+                scope: "delta-scope".to_string(),
+                instance_id: "inst-1".to_string(),
+                session_id: Some("sess-1".to_string()),
+                event: delta_event("Hello"),
+                started_at,
+            }],
+        };
+
+        let active_target = ActiveSessionTarget {
+            instance_id: "inst-1".to_string(),
+            session_id: "sess-1".to_string(),
+        };
+        let other_target = ActiveSessionTarget {
+            instance_id: "inst-1".to_string(),
+            session_id: "sess-2".to_string(),
+        };
+
+        assert!(pending.should_hold_single_delta(Instant::now(), Some(&active_target)));
+        assert!(!pending.should_hold_single_delta(Instant::now(), Some(&other_target)));
+    }
+
+    #[test]
+    fn assembler_keeps_first_delta_after_full_flush() {
+        let mut assembler = ActiveTextAssembler::default();
+        let now = Instant::now();
+        let delta = ActiveTextDelta {
+            instance_id: "inst-1".to_string(),
+            session_id: "sess-1".to_string(),
+            message_id: "msg-1".to_string(),
+            part_id: "part-1".to_string(),
+            delta: "Hello".to_string(),
+        };
+
+        let _ = assembler.absorb(delta.clone(), now);
+        let _ = assembler.flush_message("inst-1", "sess-1", "msg-1", now);
+        let _ = assembler.absorb(
+            ActiveTextDelta {
+                delta: " world".to_string(),
+                ..delta
+            },
+            now,
+        );
+        let emitted =
+            assembler.take_due(now + Duration::from_millis(ACTIVE_STREAM_STORE_WINDOW_MS + 1));
+
+        assert!(emitted.iter().any(|event| {
+            coalesced_payload_event(event)
+                .get("type")
+                .and_then(Value::as_str)
+                == Some("message.part.delta")
+                && coalesced_payload_event(event)
+                    .get("properties")
+                    .and_then(|props| props.get("delta"))
+                    .and_then(Value::as_str)
+                    == Some(" world")
+        }));
+    }
+
+    #[test]
+    fn flush_store_only_all_preserves_canonical_text_without_preview() {
+        let mut assembler = ActiveTextAssembler::default();
+        let now = Instant::now();
+        let _ = assembler.absorb(
+            ActiveTextDelta {
+                instance_id: "inst-1".to_string(),
+                session_id: "sess-1".to_string(),
+                message_id: "msg-1".to_string(),
+                part_id: "part-1".to_string(),
+                delta: "Hello".to_string(),
+            },
+            now,
+        );
+
+        let emitted = assembler.flush_store_only_all(now + Duration::from_millis(1));
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(
+            coalesced_payload_event(&emitted[0])
+                .get("type")
+                .and_then(Value::as_str),
+            Some("message.part.delta")
+        );
+        assert_eq!(
+            coalesced_payload_event(&emitted[0])
+                .get("properties")
+                .and_then(|props| props.get("delta"))
+                .and_then(Value::as_str),
+            Some("Hello")
+        );
     }
 
     #[test]

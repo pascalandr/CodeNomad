@@ -1,4 +1,6 @@
-import { Match, Show, Suspense, Switch, createEffect, lazy } from "solid-js"
+import { Match, Show, Suspense, Switch, lazy } from "solid-js"
+import FastStreamingText from "./fast-streaming-text"
+import { getAssistantStreamText } from "../stores/assistant-stream"
 import { isItemExpanded, toggleItemExpanded } from "../stores/tool-call-state"
 import { Markdown } from "./markdown"
 import { useTheme } from "../lib/theme"
@@ -11,6 +13,7 @@ const LazyToolCall = lazy(() => import("./tool-call"))
 
 interface MessagePartProps {
   part: ClientPart
+  messageId?: string
   messageType?: "user" | "assistant"
   messageStatus?: MessageStatus
   instanceId: string
@@ -24,7 +27,6 @@ interface MessagePartProps {
 export default function MessagePart(props: MessagePartProps) {
 
   const { isDark } = useTheme()
-  let lastStreamingRenderKey = ""
   const partType = () => props.part?.type || ""
   const reasoningId = () => `reasoning-${props.part?.id || ""}`
   const isReasoningExpanded = () => isItemExpanded(reasoningId())
@@ -71,25 +73,16 @@ export default function MessagePart(props: MessagePartProps) {
   const shouldUsePlainStreamingText = () => {
     if (!isAssistantStreaming()) return false
     const part = props.part
-    return part?.type === "text" && typeof part.text === "string" && part.text.length > 0
+    if (part?.type !== "text") return false
+    const partId = typeof (part as any)?.id === "string" ? (part as any).id : undefined
+    const streamed = getAssistantStreamText(props.instanceId, props.sessionId, props.messageId, partId)
+    return Boolean(streamed && streamed.length > 0) || (typeof part.text === "string" && part.text.length > 0)
   }
 
-  createEffect(() => {
-    if (!shouldUsePlainStreamingText()) {
-      lastStreamingRenderKey = ""
-      return
-    }
-
-    const partId = typeof (props.part as any)?.id === "string" ? (props.part as any).id : ""
-    const text = plainTextContent()
-    const renderKey = `${partId}:${text.length}:${text.slice(-64)}`
-    if (renderKey === lastStreamingRenderKey) {
-      return
-    }
-
-    lastStreamingRenderKey = renderKey
-    Promise.resolve().then(() => props.onRendered?.())
-  })
+  const streamedTextContent = () => {
+    const partId = typeof (props.part as any)?.id === "string" ? (props.part as any).id : undefined
+    return getAssistantStreamText(props.instanceId, props.sessionId, props.messageId, partId) ?? plainTextContent()
+  }
 
   function reasoningSegmentHasText(segment: unknown): boolean {
     if (typeof segment === "string") {
@@ -168,7 +161,14 @@ export default function MessagePart(props: MessagePartProps) {
           >
             <Show
               when={!shouldUsePlainStreamingText() && canRenderMarkdown()}
-              fallback={<div class="message-streaming-plain-text" dir="auto">{plainTextContent()}</div>}
+              fallback={
+                <FastStreamingText
+                  class="message-streaming-plain-text"
+                  dir="auto"
+                  text={streamedTextContent()}
+                  onRendered={props.onRendered}
+                />
+              }
             >
               <Markdown
                 part={createTextPartForMarkdown()}

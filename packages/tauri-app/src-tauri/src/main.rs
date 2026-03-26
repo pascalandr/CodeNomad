@@ -5,7 +5,8 @@ mod desktop_event_transport;
 
 use cli_manager::{CliProcessManager, CliStatus};
 use desktop_event_transport::{
-    DesktopEventTransportManager, DesktopEventsStartRequest, DesktopEventsStartResult,
+    ActiveSessionTarget, DesktopEventTransportManager, DesktopEventsStartRequest,
+    DesktopEventsStartResult,
 };
 use keepawake::KeepAwake;
 use serde::Deserialize;
@@ -86,6 +87,27 @@ fn desktop_events_start(
 #[tauri::command]
 fn desktop_events_stop(state: tauri::State<AppState>) {
     state.desktop_events.stop();
+}
+
+#[tauri::command]
+fn desktop_events_set_active_session(
+    state: tauri::State<AppState>,
+    instance_id: Option<String>,
+    session_id: Option<String>,
+) {
+    let target = match (instance_id, session_id) {
+        (Some(instance_id), Some(session_id))
+            if !instance_id.trim().is_empty() && !session_id.trim().is_empty() =>
+        {
+            Some(ActiveSessionTarget {
+                instance_id,
+                session_id,
+            })
+        }
+        _ => None,
+    };
+
+    state.desktop_events.set_active_session_target(target);
 }
 
 #[tauri::command]
@@ -346,6 +368,7 @@ fn main() {
             cli_restart,
             desktop_events_start,
             desktop_events_stop,
+            desktop_events_set_active_session,
             wake_lock_start,
             wake_lock_stop
         ])

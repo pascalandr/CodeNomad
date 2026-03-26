@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core"
 import { listen } from "@tauri-apps/api/event"
 import type { WorkspaceEventPayload } from "../../../../server/src/api-types"
 import type {
+  DesktopEventActiveSessionTarget,
   DesktopEventsStartResult,
   DesktopEventTransportStartOptions,
   DesktopEventTransportStatusPayload,
@@ -111,5 +112,16 @@ export async function connectTauriWorkspaceEvents(
         log.warn("Failed to stop native desktop event transport", error)
       })
     },
+  }
+}
+
+export async function setTauriDesktopActiveSession(target: DesktopEventActiveSessionTarget | null): Promise<void> {
+  try {
+    await invoke("desktop_events_set_active_session", {
+      instanceId: target?.instanceId ?? null,
+      sessionId: target?.sessionId ?? null,
+    })
+  } catch (error) {
+    log.warn("Failed to update native desktop active session", error)
   }
 }

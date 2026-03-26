@@ -22,6 +22,8 @@ import { initReleaseNotifications } from "./stores/releases"
 import { runtimeEnv } from "./lib/runtime-env"
 import { useI18n } from "./lib/i18n"
 import { setWakeLockDesired } from "./lib/native/wake-lock"
+import { setTauriDesktopActiveSession } from "./lib/native/desktop-events"
+import { clearAssistantStreamAll } from "./stores/assistant-stream"
 import {
   hasInstances,
   isSelectingFolder,
@@ -223,6 +225,25 @@ const App: Component = () => {
     const instance = activeInstance()
     if (!instance) return null
     return activeSessionId().get(instance.id) || null
+  })
+
+  const activeStreamTarget = createMemo(() => {
+    const instance = activeInstance()
+    const sessionId = activeSessionIdForInstance()
+    if (!instance || !sessionId) return null
+    return {
+      instanceId: instance.id,
+      sessionId,
+    }
+  })
+
+  createEffect(() => {
+    if (runtimeEnv.host !== "tauri") {
+      return
+    }
+
+    clearAssistantStreamAll()
+    void setTauriDesktopActiveSession(activeStreamTarget())
   })
 
   const launchErrorPath = () => {
