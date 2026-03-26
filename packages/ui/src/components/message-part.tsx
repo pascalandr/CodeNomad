@@ -1,8 +1,12 @@
-import { Match, Show, Suspense, Switch, lazy } from "solid-js"
+import { Match, Show, Suspense, Switch, createMemo, lazy } from "solid-js"
+import { resolveAssistantStreamRenderDecision } from "./assistant-streaming-state"
+import FastStreamingText from "./fast-streaming-text"
+import { getAssistantStreamPreviewText } from "../stores/assistant-stream"
 import { isItemExpanded, toggleItemExpanded } from "../stores/tool-call-state"
 import { Markdown } from "./markdown"
 import { useTheme } from "../lib/theme"
 import { partHasRenderableText, SDKPart, TextPart, ClientPart } from "../types/message"
+import type { MessageStatus } from "../stores/message-v2/types"
 
 type ToolCallPart = Extract<ClientPart, { type: "tool" }>
 
@@ -10,7 +14,9 @@ const LazyToolCall = lazy(() => import("./tool-call"))
 
 interface MessagePartProps {
   part: ClientPart
+  messageId?: string
   messageType?: "user" | "assistant"
+  messageStatus?: MessageStatus
   instanceId: string
   sessionId: string
   // For user messages, keep the primary prompt text visible even when synthetic (optimistic).
@@ -63,6 +69,25 @@ export default function MessagePart(props: MessagePartProps) {
     const id = (props.part as unknown as { id?: unknown })?.id
     return typeof id === "string" && id.length > 0
   }
+
+  const previewTextContent = () => {
+    const partId = typeof (props.part as any)?.id === "string" ? (props.part as any).id : undefined
+    return getAssistantStreamPreviewText(props.instanceId, props.sessionId, props.messageId, partId)
+  }
+
+  const hasStreamingPreview = () => {
+    const preview = previewTextContent()
+    return typeof preview === "string" && preview.length > 0
+  }
+
+  const assistantStreamRender = createMemo(() =>
+    resolveAssistantStreamRenderDecision({
+      messageType: props.messageType,
+      messageStatus: props.messageStatus,
+      part: props.part,
+      previewText: previewTextContent(),
+    }),
+  )
 
   function reasoningSegmentHasText(segment: unknown): boolean {
     if (typeof segment === "string") {
@@ -131,7 +156,7 @@ export default function MessagePart(props: MessagePartProps) {
   return (
     <Switch>
       <Match when={partType() === "text"}>
-        <Show when={!shouldHideTextPart() && partHasRenderableText(props.part)}>
+        <Show when={!shouldHideTextPart() && (partHasRenderableText(props.part) || hasStreamingPreview())}>
           <div
             class={canRenderMarkdown() ? markdownContainerClass() : textContainerClass()}
             dir="auto"
@@ -139,13 +164,24 @@ export default function MessagePart(props: MessagePartProps) {
             data-part-type="text"
             data-part-id={typeof (props.part as any)?.id === "string" ? (props.part as any).id : undefined}
           >
-            <Show when={canRenderMarkdown()} fallback={<span class="text-primary" dir="auto">{plainTextContent()}</span>}>
+            <Show
+              when={assistantStreamRender().mode === "complete_rich" && canRenderMarkdown()}
+              fallback={
+                <FastStreamingText
+                  class="message-streaming-plain-text"
+                  dir="auto"
+                  text={assistantStreamRender().text}
+                  onRendered={props.onRendered}
+                />
+              }
+            >
               <Markdown
                 part={createTextPartForMarkdown()}
                 instanceId={props.instanceId}
                 sessionId={props.sessionId}
                 isDark={isDark()}
                 size={isAssistantMessage() ? "tight" : "base"}
+                deferRichRender={false}
                 onRendered={props.onRendered}
               />
             </Show>

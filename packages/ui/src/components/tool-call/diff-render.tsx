@@ -43,6 +43,8 @@ export function createDiffContentRenderer(params: {
   handleScrollRendered: () => void
   onContentRendered?: () => void
 }) {
+  let lastRenderedKey: string | undefined
+
   const registerTracked = (element: HTMLDivElement | null) => {
     params.scrollHelpers.registerContainer(element)
   }
@@ -87,7 +89,13 @@ export function createDiffContentRenderer(params: {
       params.setDiffViewMode(mode)
     }
 
+    const renderKey = `${selectedVariant}:${options?.cacheKey ?? ""}:${themeKey}:${currentMode}:${payload.filePath ?? ""}:${payload.diffText}`
+
     const handleDiffRendered = () => {
+      if (lastRenderedKey === renderKey) {
+        return
+      }
+      lastRenderedKey = renderKey
       if (!disableScrollTracking) {
         params.handleScrollRendered()
       }
