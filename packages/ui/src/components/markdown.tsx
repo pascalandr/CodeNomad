@@ -6,6 +6,8 @@ import { copyToClipboard } from "../lib/clipboard"
 import { useI18n } from "../lib/i18n"
 
 const log = getLogger("session")
+const LARGE_MARKDOWN_CHAR_THRESHOLD = 12_000
+const LARGE_MARKDOWN_LINE_THRESHOLD = 300
 
 type MarkdownModule = typeof import("../lib/markdown")
 
@@ -73,7 +75,7 @@ function renderFallbackHtml(content: string): string {
     return ""
   }
 
-  return escapeHtml(content).replace(/\n/g, "<br />")
+  return `<pre class="markdown-fallback-pre" dir="auto">${escapeHtml(content)}</pre>`
 }
 
 interface MarkdownProps {
@@ -83,7 +85,23 @@ interface MarkdownProps {
   isDark?: boolean
   size?: "base" | "sm" | "tight"
   disableHighlight?: boolean
+  deferRichRender?: boolean
   onRendered?: () => void
+}
+
+function countLines(value: string): number {
+  if (!value) return 0
+  let lines = 1
+  for (let index = 0; index < value.length; index++) {
+    if (value.charCodeAt(index) === 10) lines += 1
+  }
+  return lines
+}
+
+function shouldDeferLargeMarkdown(text: string, enabled: boolean | undefined): boolean {
+  if (!enabled) return false
+  if (text.length >= LARGE_MARKDOWN_CHAR_THRESHOLD) return true
+  return countLines(text) >= LARGE_MARKDOWN_LINE_THRESHOLD
 }
 
 export function Markdown(props: MarkdownProps) {
@@ -92,8 +110,15 @@ export function Markdown(props: MarkdownProps) {
   let containerRef: HTMLDivElement | undefined
   let latestRequestKey = ""
   let cleanupLanguageListener: (() => void) | undefined
+  let lastRenderedNotificationKey = ""
+  let cancelDeferredRender: (() => void) | undefined
 
-  const notifyRendered = () => {
+  const notifyRendered = (requestKey: string, renderedHtml: string) => {
+    const notificationKey = `${requestKey}:${hashText(renderedHtml)}`
+    if (notificationKey === lastRenderedNotificationKey) {
+      return
+    }
+    lastRenderedNotificationKey = notificationKey
     Promise.resolve().then(() => props.onRendered?.())
   }
 
@@ -130,7 +155,52 @@ export function Markdown(props: MarkdownProps) {
     }
     setHtml(renderedHtml)
     cacheHandle.set(cacheEntry)
-    notifyRendered()
+    notifyRendered(snapshot.requestKey, renderedHtml)
+  }
+
+  const clearDeferredRender = () => {
+    cancelDeferredRender?.()
+    cancelDeferredRender = undefined
+  }
+
+  const deferRenderSnapshot = (snapshot: ReturnType<typeof resolved>) => {
+    clearDeferredRender()
+
+    const run = () => {
+      cancelDeferredRender = undefined
+      if (latestRequestKey !== snapshot.requestKey) {
+        return
+      }
+      void renderSnapshot(snapshot).catch((error) => {
+        log.error("Failed to render deferred markdown:", error)
+        if (latestRequestKey === snapshot.requestKey) {
+          commitCacheEntry(snapshot, renderFallbackHtml(snapshot.text))
+        }
+      })
+    }
+
+    const idleWindow = window as Window & {
+      requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number
+      cancelIdleCallback?: (handle: number) => void
+    }
+
+    if (typeof idleWindow.requestIdleCallback === "function") {
+      const handle = idleWindow.requestIdleCallback(run, { timeout: 120 })
+      cancelDeferredRender = () => idleWindow.cancelIdleCallback?.(handle)
+      return
+    }
+
+    if (typeof requestAnimationFrame === "function") {
+      const frame = requestAnimationFrame(() => {
+        const timeout = window.setTimeout(run, 0)
+        cancelDeferredRender = () => window.clearTimeout(timeout)
+      })
+      cancelDeferredRender = () => cancelAnimationFrame(frame)
+      return
+    }
+
+    const timeout = window.setTimeout(run, 0)
+    cancelDeferredRender = () => window.clearTimeout(timeout)
   }
 
   const renderSnapshot = async (snapshot: ReturnType<typeof resolved>) => {
@@ -148,6 +218,7 @@ export function Markdown(props: MarkdownProps) {
   createEffect(() => {
     const snapshot = resolved()
     latestRequestKey = snapshot.requestKey
+    clearDeferredRender()
 
     const cacheMatches = (cache: RenderCache | undefined) => {
       if (!cache) return false
@@ -157,19 +228,25 @@ export function Markdown(props: MarkdownProps) {
     const localCache = snapshot.part.renderCache
     if (localCache && cacheMatches(localCache)) {
       setHtml(localCache.html)
-      notifyRendered()
+      notifyRendered(snapshot.requestKey, localCache.html)
       return
     }
 
     const globalCache = cacheHandle.get<RenderCache>()
     if (globalCache && cacheMatches(globalCache)) {
       setHtml(globalCache.html)
-      notifyRendered()
+      notifyRendered(snapshot.requestKey, globalCache.html)
       return
     }
 
-    setHtml(renderFallbackHtml(snapshot.text))
-    notifyRendered()
+    const fallbackHtml = renderFallbackHtml(snapshot.text)
+    setHtml(fallbackHtml)
+    notifyRendered(snapshot.requestKey, fallbackHtml)
+
+    if (shouldDeferLargeMarkdown(snapshot.text, props.deferRichRender)) {
+      deferRenderSnapshot(snapshot)
+      return
+    }
 
     void renderSnapshot(snapshot).catch((error) => {
       log.error("Failed to render markdown:", error)
@@ -234,6 +311,7 @@ export function Markdown(props: MarkdownProps) {
 
     onCleanup(() => {
       disposed = true
+      clearDeferredRender()
       containerRef?.removeEventListener("click", handleClick)
       cleanupLanguageListener?.()
       cleanupLanguageListener = undefined

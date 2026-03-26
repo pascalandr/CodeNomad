@@ -73,6 +73,7 @@ export function createMarkdownContentRenderer(params: {
           sessionId={params.sessionId}
           isDark={params.isDark()}
           disableHighlight={disableHighlight}
+          deferRichRender={true}
           onRendered={handleMarkdownRendered}
         />
         {params.scrollHelpers.renderSentinel({ disableTracking: disableScrollTracking })}

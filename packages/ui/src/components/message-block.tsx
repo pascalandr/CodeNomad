@@ -1,6 +1,8 @@
 import { For, Match, Show, Suspense, Switch, createEffect, createMemo, createSignal, lazy, onCleanup, untrack } from "solid-js"
 import { ChevronsDownUp, ChevronsUpDown, ExternalLink, FoldVertical, ListStart, Trash } from "lucide-solid"
 import MessageItem from "./message-item"
+import { isSupportedPartType, projectMessageEntries } from "./message-render-projection"
+import ToolCall from "./tool-call"
 import type { InstanceMessageStore } from "../stores/message-v2/instance-store"
 import type { ClientPart, MessageInfo } from "../types/message"
 import { partHasRenderableText } from "../types/message"
@@ -59,38 +61,6 @@ function extractTaskSessionId(state: ToolState | undefined): string {
   const metadata = (state as unknown as { metadata?: Record<string, unknown> }).metadata ?? {}
   const directId = metadata?.sessionId ?? metadata?.sessionID
   return typeof directId === "string" ? directId : ""
-}
-
-function reasoningHasRenderableContent(part: ClientPart): boolean {
-  if (!part || part.type !== "reasoning") {
-    return false
-  }
-  const checkSegment = (segment: unknown): boolean => {
-    if (typeof segment === "string") {
-      return segment.trim().length > 0
-    }
-    if (segment && typeof segment === "object") {
-      const candidate = segment as { text?: unknown; value?: unknown; content?: unknown[] }
-      if (typeof candidate.text === "string" && candidate.text.trim().length > 0) {
-        return true
-      }
-      if (typeof candidate.value === "string" && candidate.value.trim().length > 0) {
-        return true
-      }
-      if (Array.isArray(candidate.content)) {
-        return candidate.content.some((entry) => checkSegment(entry))
-      }
-    }
-    return false
-  }
-
-  if (checkSegment((part as any).text)) {
-    return true
-  }
-  if (Array.isArray((part as any).content)) {
-    return (part as any).content.some((entry: unknown) => checkSegment(entry))
-  }
-  return false
 }
 
 interface TaskSessionLocation {
@@ -190,6 +160,7 @@ interface ContentDisplayItem {
   key: string
   messageId: string
   startPartId: string
+  partIds: string[]
 }
 
 interface ToolDisplayItem {
@@ -205,6 +176,7 @@ interface MessageContentItemProps {
   store: () => InstanceMessageStore
   messageId: string
   startPartId: string
+  partIds: string[]
   messageIndex: number
   lastAssistantIndex: () => number
   onRevert?: (messageId: string) => void
@@ -215,12 +187,6 @@ interface MessageContentItemProps {
   onDeleteHoverChange?: (state: DeleteHoverState) => void
   selectedMessageIds?: () => Set<string>
   onToggleSelectedMessage?: (messageId: string, selected: boolean) => void
-}
-
-function isSupportedPartType(part: unknown): boolean {
-  const type = (part as any)?.type
-  // Ignore part types the UI does not support rendering yet.
-  return !(typeof type === "string" && type === "patch")
 }
 
 function isContentPartType(type: unknown): boolean {
@@ -242,18 +208,11 @@ function MessageContentItem(props: MessageContentItemProps) {
   const parts = createMemo<ClientPart[]>(() => {
     const current = record()
     if (!current) return []
-    const ids = current.partIds
-    const startIndex = ids.indexOf(props.startPartId)
-    if (startIndex === -1) return []
-
     const resolved: ClientPart[] = []
-    for (let idx = startIndex; idx < ids.length; idx++) {
-      const partId = ids[idx]
+    for (const partId of props.partIds) {
       const part = current.parts[partId]?.data
       if (!part) continue
       if (!isSupportedPartType(part)) continue
-
-      if (!isContentPartType((part as any).type)) break
       resolved.push(part)
     }
 
@@ -535,6 +494,7 @@ type ReasoningDisplayItem = {
   type: "reasoning"
   key: string
   part: ClientPart
+  text: string
   messageInfo?: MessageInfo
   showAgentMeta?: boolean
   defaultExpanded: boolean
@@ -635,71 +595,56 @@ export default function MessageBlock(props: MessageBlockProps) {
       return cachedBlock.block
     }
 
-    const { orderedParts } = buildRecordDisplayData(props.instanceId, current)
+    const projected = projectMessageEntries(props.instanceId, current, t)
     const items: MessageBlockItem[] = []
     const blockContentKeys: string[] = []
     const blockToolKeys: string[] = []
-    let pendingParts: ClientPart[] = []
     let agentMetaAttached = current.role !== "assistant"
     const defaultAccentColor = current.role === "user" ? USER_BORDER_COLOR : ASSISTANT_BORDER_COLOR
     let lastAccentColor = defaultAccentColor
 
-    const flushContent = () => {
-      if (pendingParts.length === 0) return
-      const startPartId = typeof (pendingParts[0] as any)?.id === "string" ? ((pendingParts[0] as any).id as string) : ""
-      if (!startPartId) {
-        pendingParts = []
+    projected.forEach((entry) => {
+      if (entry.kind === "content") {
+        if (!agentMetaAttached && entry.hasRenderableText) {
+          agentMetaAttached = true
+        }
+
+        const segmentKey = entry.key
+        let cached = sessionCache.messageItems.get(segmentKey)
+        if (!cached) {
+          cached = {
+            type: "content",
+            key: segmentKey,
+            messageId: current.id,
+            startPartId: entry.startPartId,
+            partIds: entry.partIds,
+          }
+          sessionCache.messageItems.set(segmentKey, cached)
+        } else {
+          cached.partIds = entry.partIds
+        }
+
+        items.push(cached)
+        blockContentKeys.push(segmentKey)
+        lastAccentColor = defaultAccentColor
         return
       }
 
-      if (!agentMetaAttached && pendingParts.some((part) => partHasRenderableText(part))) {
-        agentMetaAttached = true
-      }
-
-      const segmentKey = `${current.id}:content:${startPartId}`
-      let cached = sessionCache.messageItems.get(segmentKey)
-      if (!cached) {
-        cached = {
-          type: "content",
-          key: segmentKey,
-          messageId: current.id,
-          startPartId,
-        }
-        sessionCache.messageItems.set(segmentKey, cached)
-      }
-
-      items.push(cached)
-      blockContentKeys.push(segmentKey)
-      lastAccentColor = defaultAccentColor
-      pendingParts = []
-    }
-
-    orderedParts.forEach((part, partIndex) => {
-      if (!isSupportedPartType(part)) {
-        return
-      }
-      if (part.type === "tool") {
-        flushContent()
-        const partId = part.id
-        if (!partId) {
-          // Tool parts are required to have ids; if one slips through, skip rendering
-          // to avoid unstable keys and accidental remount cascades.
-          return
-        }
-        const key = `${current.id}:${partId}`
+      if (entry.kind === "tool") {
+        const key = entry.key
         let toolItem = sessionCache.toolItems.get(key)
         if (!toolItem) {
           toolItem = {
             type: "tool",
             key,
             messageId: current.id,
-            partId,
+            partId: entry.partId,
           }
           sessionCache.toolItems.set(key, toolItem)
         } else {
           toolItem.key = key
           toolItem.messageId = current.id
-          toolItem.partId = partId
+          toolItem.partId = entry.partId
         }
         items.push(toolItem)
         blockToolKeys.push(key)
@@ -707,68 +652,48 @@ export default function MessageBlock(props: MessageBlockProps) {
         return
       }
 
-      if (part.type === "compaction") {
-        flushContent()
-        const partId = part.id ?? ""
-        const key = `${current.id}:${partId || partIndex}:compaction`
-        const isAuto = Boolean((part as any)?.auto)
+      if (entry.kind === "compaction") {
         items.push({
           type: "compaction",
-          key,
-          part,
+          key: entry.key,
+          part: entry.part,
           messageInfo: info,
-          accentColor: isAuto ? "var(--session-status-compacting-fg)" : USER_BORDER_COLOR,
+          accentColor: entry.auto ? "var(--session-status-compacting-fg)" : USER_BORDER_COLOR,
           messageId: current.id,
-          partId,
+          partId: entry.partId,
         })
-        lastAccentColor = isAuto ? "var(--session-status-compacting-fg)" : USER_BORDER_COLOR
+        lastAccentColor = entry.auto ? "var(--session-status-compacting-fg)" : USER_BORDER_COLOR
         return
       }
 
-      if (part.type === "step-start") {
-        flushContent()
-        return
-      }
-
-      if (part.type === "step-finish") {
-        flushContent()
+      if (entry.kind === "step-finish") {
         if (props.showUsageMetrics()) {
-          const key = `${current.id}:${part.id ?? partIndex}:${part.type}`
           const accentColor = lastAccentColor || defaultAccentColor
-          items.push({ type: part.type, key, part, messageInfo: info, accentColor })
+          items.push({ type: "step-finish", key: entry.key, part: entry.part, messageInfo: info, accentColor })
           lastAccentColor = accentColor
         }
         return
       }
 
-      if (part.type === "reasoning") {
-        flushContent()
-        if (props.showThinking() && reasoningHasRenderableContent(part)) {
-          const partId = part.id ?? ""
-          const key = `${current.id}:${partId || partIndex}:reasoning`
-          const showAgentMeta = current.role === "assistant" && !agentMetaAttached
-          if (showAgentMeta) {
-            agentMetaAttached = true
-          }
-          items.push({
-            type: "reasoning",
-            key,
-            part,
-            messageInfo: info,
-            showAgentMeta,
-            defaultExpanded: props.thinkingDefaultExpanded(),
-            messageId: current.id,
-            partId,
-          })
-          lastAccentColor = ASSISTANT_BORDER_COLOR
+      if (entry.kind === "reasoning" && props.showThinking()) {
+        const showAgentMeta = current.role === "assistant" && !agentMetaAttached
+        if (showAgentMeta) {
+          agentMetaAttached = true
         }
-        return
+        items.push({
+          type: "reasoning",
+          key: entry.key,
+          part: entry.part,
+          text: entry.text,
+          messageInfo: info,
+          showAgentMeta,
+          defaultExpanded: props.thinkingDefaultExpanded(),
+          messageId: current.id,
+          partId: entry.partId,
+        })
+        lastAccentColor = ASSISTANT_BORDER_COLOR
       }
-
-      pendingParts.push(part)
     })
-
-    flushContent()
 
     const resultBlock: MessageDisplayBlock = { record: current, items }
     sessionCache.messageBlocks.set(current.id, {
@@ -811,6 +736,7 @@ export default function MessageBlock(props: MessageBlockProps) {
                     store={props.store}
                     messageId={(item as ContentDisplayItem).messageId}
                     startPartId={(item as ContentDisplayItem).startPartId}
+                    partIds={(item as ContentDisplayItem).partIds}
                     messageIndex={props.messageIndex}
                     lastAssistantIndex={props.lastAssistantIndex}
                     showDeleteMessage={index() === 0}
@@ -898,6 +824,7 @@ export default function MessageBlock(props: MessageBlockProps) {
                 <Match when={item.type === "reasoning"}>
                   <ReasoningCard
                     part={(item as ReasoningDisplayItem).part}
+                    text={(item as ReasoningDisplayItem).text}
                     messageInfo={(item as ReasoningDisplayItem).messageInfo}
                     instanceId={props.instanceId}
                     sessionId={props.sessionId}
@@ -1277,6 +1204,7 @@ function formatCostValue(value: number) {
 
 interface ReasoningCardProps {
   part: ClientPart
+  text?: string
   messageInfo?: MessageInfo
   instanceId: string
   sessionId: string
@@ -1289,6 +1217,41 @@ interface ReasoningCardProps {
   selectedMessageIds?: () => Set<string>
   onToggleSelectedMessage?: (messageId: string, selected: boolean) => void
   onContentRendered?: () => void
+}
+
+function flattenReasoningText(part: ClientPart | undefined): string {
+  const reasoningPart = part as any
+  if (!reasoningPart) return ""
+
+  const stringifySegment = (segment: unknown): string => {
+    if (typeof segment === "string") {
+      return segment
+    }
+    if (segment && typeof segment === "object") {
+      const obj = segment as { text?: unknown; value?: unknown; content?: unknown[] }
+      const pieces: string[] = []
+      if (typeof obj.text === "string") {
+        pieces.push(obj.text)
+      }
+      if (typeof obj.value === "string") {
+        pieces.push(obj.value)
+      }
+      if (Array.isArray(obj.content)) {
+        pieces.push(obj.content.map((entry) => stringifySegment(entry)).join("\n"))
+      }
+      return pieces.filter((piece) => piece && piece.trim().length > 0).join("\n")
+    }
+    return ""
+  }
+
+  const textValue = stringifySegment(reasoningPart.text)
+  if (textValue.trim().length > 0) {
+    return textValue
+  }
+  if (Array.isArray(reasoningPart.content)) {
+    return reasoningPart.content.map((entry: unknown) => stringifySegment(entry)).join("\n")
+  }
+  return ""
 }
 
 function ReasoningCard(props: ReasoningCardProps) {
@@ -1344,40 +1307,7 @@ function ReasoningCard(props: ReasoningCardProps) {
 
   const hasMeta = () => Boolean(props.showAgentMeta && (agentIdentifier() || modelIdentifier()))
 
-  const reasoningText = () => {
-    const part = props.part as any
-    if (!part) return ""
-
-    const stringifySegment = (segment: unknown): string => {
-      if (typeof segment === "string") {
-        return segment
-      }
-      if (segment && typeof segment === "object") {
-        const obj = segment as { text?: unknown; value?: unknown; content?: unknown[] }
-        const pieces: string[] = []
-        if (typeof obj.text === "string") {
-          pieces.push(obj.text)
-        }
-        if (typeof obj.value === "string") {
-          pieces.push(obj.value)
-        }
-        if (Array.isArray(obj.content)) {
-          pieces.push(obj.content.map((entry) => stringifySegment(entry)).join("\n"))
-        }
-        return pieces.filter((piece) => piece && piece.trim().length > 0).join("\n")
-      }
-      return ""
-    }
-
-    const textValue = stringifySegment(part.text)
-    if (textValue.trim().length > 0) {
-      return textValue
-    }
-    if (Array.isArray(part.content)) {
-      return part.content.map((entry: unknown) => stringifySegment(entry)).join("\n")
-    }
-    return ""
-  }
+  const reasoningText = createMemo(() => props.text ?? flattenReasoningText(props.part))
 
   const toggle = () => setExpanded((prev) => !prev)
 
