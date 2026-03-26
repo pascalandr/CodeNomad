@@ -17,9 +17,7 @@ const EVENT_STATUS_NAME: &str = "desktop:event-stream-status";
 const FLUSH_INTERVAL_MS: u64 = 16;
 const DELTA_STREAM_WINDOW_MS: u64 = 48;
 const ACTIVE_STREAM_DISPLAY_WINDOW_MS: u64 = 32;
-const ACTIVE_STREAM_STORE_WINDOW_MS: u64 = 180;
 const ACTIVE_STREAM_DISPLAY_CHUNK_MAX: usize = 192;
-const ACTIVE_STREAM_STORE_CHUNK_MAX: usize = 1536;
 const MAX_BATCH_EVENTS: usize = 256;
 const DEFAULT_RECONNECT_INITIAL_DELAY_MS: u64 = 1_000;
 const DEFAULT_RECONNECT_MAX_DELAY_MS: u64 = 10_000;
@@ -551,16 +549,6 @@ impl ActiveTextAssembler {
             ));
             entry.display_pending.clear();
             entry.last_display_emit = now;
-        }
-
-        if !entry.store_pending.is_empty()
-            && (now.duration_since(entry.last_store_emit)
-                >= Duration::from_millis(ACTIVE_STREAM_STORE_WINDOW_MS)
-                || entry.store_pending.chars().count() >= ACTIVE_STREAM_STORE_CHUNK_MAX)
-        {
-            emitted.push(make_message_part_delta_event(entry, &entry.store_pending));
-            entry.store_pending.clear();
-            entry.last_store_emit = now;
         }
 
         emitted
@@ -1821,8 +1809,7 @@ mod tests {
             },
             now,
         );
-        let emitted =
-            assembler.take_due(now + Duration::from_millis(ACTIVE_STREAM_STORE_WINDOW_MS + 1));
+        let emitted = assembler.flush_store_only_all(now + Duration::from_millis(1));
 
         assert!(emitted.iter().any(|event| {
             coalesced_payload_event(event)
