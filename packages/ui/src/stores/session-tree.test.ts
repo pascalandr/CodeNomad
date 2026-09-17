@@ -201,4 +201,40 @@ describe("session tree", () => {
     })
     assert.deepEqual(collectSessionThreadIds(matched), ["root", "matching-child", "sibling"])
   })
+
+  it("filters by the displayed conversation's location regardless of descendant locations or activity", () => {
+    const sessions = sessionMap([
+      ["root", null, 100],
+      ["child", "root", 200],
+      ["grandchild", "child", 300],
+      ["local-root", null, 400],
+    ])
+    for (const item of sessions.values()) {
+      item.location = { directory: "D:\\repo" }
+      item.status = "idle"
+    }
+    const parent = sessions.get("root")!
+    parent.location = { directory: "D:\\worktrees\\feature" }
+    parent.status = "working"
+    const grandchild = sessions.get("grandchild")!
+    const project = (worktreeDirectory: string) => projectSessionFamilies(
+      buildSessionThreadsFromMap(sessions, ["root", "local-root"]),
+      { sort: "activity", worktreeDirectory, getWorktreeLabel: directory => directory },
+    )
+    assert.deepEqual(project("D:\\repo").map(thread => thread.session.id), ["local-root"], "an active parent elsewhere and old idle children do not match")
+    assert.equal(project("D:/worktrees/feature")[0].session.id, "root")
+    assert.equal(project("").length, 2, "all worktrees retains both families")
+    for (const status of ["working", "compacting"] as const) {
+      grandchild.status = status
+      assert.deepEqual(collectSessionThreadIds(project("D:\\repo")), ["local-root"])
+      assert.deepEqual(collectSessionThreadIds(project("D:/worktrees/feature")), ["root", "child", "grandchild"], "matching conversations retain their complete families")
+    }
+    grandchild.location = { directory: "D:\\another-checkout" }
+    assert.equal(project("D:\\repo").length, 1, "active descendants elsewhere do not match")
+    grandchild.location = { directory: "D:\\repo" }
+    grandchild.status = "idle"
+    assert.equal(project("D:\\repo").length, 1, "completion does not alter the conversation's placement")
+    parent.status = "idle"
+    assert.equal(project("D:/worktrees/feature")[0].session.id, "root", "the parent's own checkout remains visible when idle")
+  })
 })

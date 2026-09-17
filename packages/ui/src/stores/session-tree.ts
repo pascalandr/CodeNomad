@@ -39,10 +39,9 @@ export function projectSessionFamilies(
   const projected = threads.filter((thread) => {
     if (options.matchesSession && !someSession(thread, options.matchesSession)) return false
     if (!worktreeDirectory) return true
-    return someSession(
-      thread,
-      (session) => normalizeSessionDirectory(session.location?.directory) === worktreeDirectory,
-    )
+    // Filter the displayed conversation by the same native location as its badge.
+    // Descendants retain their own locations but do not change this placement.
+    return normalizeSessionDirectory(thread.session.location?.directory) === worktreeDirectory
   })
 
   return [...projected].sort((left, right) => {

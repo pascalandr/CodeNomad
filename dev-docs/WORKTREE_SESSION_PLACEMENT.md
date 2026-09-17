@@ -174,6 +174,12 @@ authorized workspace spelling before changing UI state.
 
 ### Final native/UI integration (2026-09-17)
 
+Follow-up: the worktree filter uses the displayed root conversation's native
+directory, matching its badge. Descendant locations and activity do not override
+that placement. Matching conversations retain their complete families, and text
+search still retains ancestry. A regression covers inactive and active descendants
+in other checkouts, completion and the unfiltered view.
+
 Merged `dev@e47e01c6` (PR #697) into this branch. Discovery and canonical
 `server.status()` adaptation are now inherited from that independently merged
 change. The native worktree/family fixture passed again against isolated official
